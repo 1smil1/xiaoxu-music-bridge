@@ -162,6 +162,94 @@ public sealed class LocalLyricService
             return null;
         }
 
+        var directLyrics = await SearchQqMusicDirectAsync(status, title, artist, cancellationToken);
+        if (directLyrics is not null)
+        {
+            return directLyrics;
+        }
+
+        return await SearchQqMusicYgkingAsync(status, title, artist, cancellationToken);
+    }
+
+    private async Task<LyricResponse?> SearchQqMusicDirectAsync(MediaStatus status, string title, string artist, CancellationToken cancellationToken)
+    {
+        foreach (var query in GetSearchQueries(title, artist))
+        {
+            var searchUrl = $"https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w={Uri.EscapeDataString(query)}&format=json&p=1&n=10";
+
+            QqDirectSearchResponse? search;
+            try
+            {
+                using var request = CreateQqRequest(searchUrl);
+                using var response = await _httpClient.SendAsync(request, cancellationToken);
+                if (!response.IsSuccessStatusCode)
+                {
+                    continue;
+                }
+
+                search = await response.Content.ReadFromJsonAsync<QqDirectSearchResponse>(cancellationToken);
+            }
+            catch
+            {
+                continue;
+            }
+
+            var songs = search?.Data?.Song?.List;
+            if (songs is null || songs.Length == 0)
+            {
+                continue;
+            }
+
+            var best = songs
+                .OrderByDescending(song => Score(song, title, artist, status.DurationMs))
+                .FirstOrDefault(song => !string.IsNullOrWhiteSpace(song.SongMid));
+            if (best is null || Score(best, title, artist, status.DurationMs) < 80)
+            {
+                continue;
+            }
+
+            QqDirectLyricResponse? lyric;
+            try
+            {
+                var lyricUrl = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg"
+                    + $"?songmid={Uri.EscapeDataString(best.SongMid)}"
+                    + "&format=json&nobase64=1&g_tk=5381&loginUin=0&hostUin=0"
+                    + "&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq&needNewCode=0";
+                using var request = CreateQqRequest(lyricUrl);
+                using var response = await _httpClient.SendAsync(request, cancellationToken);
+                if (!response.IsSuccessStatusCode)
+                {
+                    continue;
+                }
+
+                lyric = await response.Content.ReadFromJsonAsync<QqDirectLyricResponse>(cancellationToken);
+            }
+            catch
+            {
+                continue;
+            }
+
+            var lrc = lyric?.Lyric;
+            if (string.IsNullOrWhiteSpace(lrc))
+            {
+                continue;
+            }
+
+            return new LyricResponse(
+                true,
+                status.Title,
+                status.Artist,
+                $"{string.Join("/", best.Singer.Select(singer => singer.Name))} - {best.SongName}",
+                lrc,
+                "qqmusic-direct",
+                true);
+        }
+
+        return null;
+    }
+
+    private async Task<LyricResponse?> SearchQqMusicYgkingAsync(MediaStatus status, string title, string artist, CancellationToken cancellationToken)
+    {
         var query = string.IsNullOrWhiteSpace(artist) ? title : $"{title} {artist}";
         var searchUrl = $"https://api.ygking.top/api/search?keyword={Uri.EscapeDataString(query)}&type=song&num=8";
 
@@ -214,6 +302,24 @@ public sealed class LocalLyricService
             lrc,
             "qqmusic",
             true);
+    }
+
+    private static HttpRequestMessage CreateQqRequest(string url)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Referrer = new Uri("https://y.qq.com/");
+        request.Headers.UserAgent.ParseAdd("Mozilla/5.0");
+        return request;
+    }
+
+    private static IEnumerable<string> GetSearchQueries(string title, string artist)
+    {
+        if (!string.IsNullOrWhiteSpace(artist))
+        {
+            yield return $"{title} {artist}";
+        }
+
+        yield return title;
     }
 
     private static int Score(LrclibTrack track, string title, string artist, long durationMs)
@@ -386,6 +492,36 @@ public sealed class LocalLyricService
         return score;
     }
 
+    private static int Score(QqDirectSong song, string title, string artist, long durationMs)
+    {
+        var score = 0;
+        var songName = Normalize(song.SongName);
+        var artistName = Normalize(string.Join(" ", song.Singer.Select(item => item.Name)));
+        var wantedTitle = Normalize(title);
+        var wantedArtist = Normalize(artist);
+
+        if (!IsTitleMatch(songName, wantedTitle)) return -1000;
+        if (songName == wantedTitle) score += 100;
+        else if (songName.Contains(wantedTitle) || wantedTitle.Contains(songName)) score += 45;
+
+        if (!string.IsNullOrWhiteSpace(wantedArtist))
+        {
+            if (artistName == wantedArtist) score += 70;
+            else if (artistName.Contains(wantedArtist) || wantedArtist.Contains(artistName)) score += 35;
+        }
+
+        if (durationMs > 0 && song.Interval > 0)
+        {
+            var deltaSeconds = Math.Abs(song.Interval - durationMs / 1000.0);
+            if (deltaSeconds <= 3) score += 35;
+            else if (deltaSeconds <= 8) score += 15;
+        }
+
+        if (song.SongName.Contains("伴奏", StringComparison.OrdinalIgnoreCase)) score -= 100;
+        if (song.SongName.Contains("翻自", StringComparison.OrdinalIgnoreCase)) score -= 30;
+        return score;
+    }
+
     private static string CleanTitle(string title)
     {
         var cleaned = Regex.Replace(title, @"\s*[-(（\[]?\s*(feat\.?|ft\.?|with)\s+.*$", "", RegexOptions.IgnoreCase);
@@ -453,6 +589,24 @@ public sealed class LocalLyricService
         [property: JsonPropertyName("data")] QqLyricData? Data);
 
     private sealed record QqLyricData(
+        [property: JsonPropertyName("lyric")] string? Lyric);
+
+    private sealed record QqDirectSearchResponse(
+        [property: JsonPropertyName("data")] QqDirectSearchData? Data);
+
+    private sealed record QqDirectSearchData(
+        [property: JsonPropertyName("song")] QqDirectSongResult? Song);
+
+    private sealed record QqDirectSongResult(
+        [property: JsonPropertyName("list")] QqDirectSong[] List);
+
+    private sealed record QqDirectSong(
+        [property: JsonPropertyName("songmid")] string SongMid,
+        [property: JsonPropertyName("songname")] string SongName,
+        [property: JsonPropertyName("singer")] QqSinger[] Singer,
+        [property: JsonPropertyName("interval")] int Interval);
+
+    private sealed record QqDirectLyricResponse(
         [property: JsonPropertyName("lyric")] string? Lyric);
 
     private sealed record NeteaseSearchResponse(

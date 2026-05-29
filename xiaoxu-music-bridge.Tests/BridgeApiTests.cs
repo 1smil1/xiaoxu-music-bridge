@@ -331,6 +331,75 @@ public sealed class BridgeApiTests
 
 
     [TestMethod]
+    public async Task LyricsCurrent_UsesDirectQqMusicLyricsFirst()
+    {
+        var lyricsDirectory = Path.Combine(Path.GetTempPath(), $"xiaoxu-lyrics-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(lyricsDirectory);
+        try
+        {
+            var status = new MediaStatus(
+                Connected: true,
+                Source: "QQMusic",
+                Title: "星降る海 (Starry Sea)",
+                Artist: "Aqu3ra/早見沙織 (はやみ さおり)",
+                Album: "超かぐや姫！",
+                CoverUrl: null,
+                IsPlaying: true,
+                PositionMs: 0,
+                DurationMs: 253441,
+                UpdatedAt: DateTimeOffset.Now);
+            var handler = new FakeHttpMessageHandler(request =>
+            {
+                var url = request.RequestUri?.ToString() ?? "";
+                if (url.Contains("client_search_cp"))
+                {
+                    return JsonSerializer.Serialize(new
+                    {
+                        data = new
+                        {
+                            song = new
+                            {
+                                list = new[]
+                                {
+                                    new
+                                    {
+                                        songmid = "001AdB7w12o1XY",
+                                        songname = "星降る海 (Starry Sea)",
+                                        singer = new[] { new { name = "Aqu3ra" }, new { name = "早見沙織" } },
+                                        interval = 253
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                return JsonSerializer.Serialize(new
+                {
+                    retcode = 0,
+                    code = 0,
+                    lyric = "[00:01.37]幾千の時を巡って今\n[00:07.25]僕ら出会えたの"
+                });
+            });
+            await using var factory = CreateFactory(new FakeMediaSessionService { Status = status }, lyricsDirectory, handler);
+            using var client = factory.CreateClient();
+
+            var response = await client.GetFromJsonAsync<LyricResponse>("/lyrics/current");
+
+            Assert.IsNotNull(response);
+            Assert.IsTrue(response.Found);
+            Assert.AreEqual("qqmusic-direct", response.Source);
+            Assert.IsTrue(response.Synced);
+            Assert.AreEqual("Aqu3ra/早見沙織 - 星降る海 (Starry Sea)", response.FileName);
+            StringAssert.Contains(response.Lrc, "幾千の時");
+        }
+        finally
+        {
+            Directory.Delete(lyricsDirectory, recursive: true);
+        }
+    }
+
+    [TestMethod]
     public async Task LyricsCurrent_UsesQqMusicBeforeOtherOnlineSources()
     {
         var lyricsDirectory = Path.Combine(Path.GetTempPath(), $"xiaoxu-lyrics-{Guid.NewGuid():N}");
