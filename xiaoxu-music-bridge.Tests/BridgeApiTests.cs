@@ -98,11 +98,59 @@ public sealed class BridgeApiTests
         Assert.AreEqual(HttpStatusCode.NotFound, response.StatusCode);
     }
 
+    [TestMethod]
+    public async Task LyricsCurrent_ReturnsMatchingLocalLrc()
+    {
+        var lyricsDirectory = Path.Combine(Path.GetTempPath(), $"xiaoxu-lyrics-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(lyricsDirectory);
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(lyricsDirectory, "兰音Reine - 云月谣.lrc"), "[00:01.00]星河落下\n[00:03.00]梦在发光");
+            var status = new MediaStatus(
+                Connected: true,
+                Source: "QQMusic",
+                Title: "云月谣",
+                Artist: "兰音Reine",
+                Album: "",
+                CoverUrl: null,
+                IsPlaying: true,
+                PositionMs: 0,
+                DurationMs: 120000,
+                UpdatedAt: DateTimeOffset.Now);
+            await using var factory = CreateFactory(new FakeMediaSessionService { Status = status }, lyricsDirectory);
+            using var client = factory.CreateClient();
+
+            var response = await client.GetFromJsonAsync<LyricResponse>("/lyrics/current");
+
+            Assert.IsNotNull(response);
+            Assert.IsTrue(response.Found);
+            Assert.AreEqual("兰音Reine - 云月谣.lrc", response.FileName);
+            StringAssert.Contains(response.Lrc, "星河落下");
+        }
+        finally
+        {
+            Directory.Delete(lyricsDirectory, recursive: true);
+        }
+    }
+
     private static WebApplicationFactory<Program> CreateFactory(IMediaSessionService mediaSessionService)
     {
         return new WebApplicationFactory<Program>()
             .WithWebHostBuilder(builder =>
             {
+                builder.ConfigureServices(services =>
+                {
+                    services.AddSingleton(mediaSessionService);
+                });
+            });
+    }
+
+    private static WebApplicationFactory<Program> CreateFactory(IMediaSessionService mediaSessionService, string lyricsDirectory)
+    {
+        return new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.UseSetting("Lyrics:Directory", lyricsDirectory);
                 builder.ConfigureServices(services =>
                 {
                     services.AddSingleton(mediaSessionService);
@@ -134,4 +182,5 @@ public sealed class BridgeApiTests
 
     private sealed record HealthResponse(bool Ok, string Name, string Version);
     private sealed record ControlResponse(bool Ok);
+    private sealed record LyricResponse(bool Found, string? Title, string? Artist, string? FileName, string? Lrc);
 }

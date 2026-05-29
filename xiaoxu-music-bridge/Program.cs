@@ -1,3 +1,4 @@
+using xiaoxu_music_bridge.Lyrics;
 using xiaoxu_music_bridge.Media;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -18,6 +19,7 @@ builder.Services.AddCors(options =>
     });
 });
 builder.Services.AddSingleton<IMediaSessionService, WindowsMediaSessionService>();
+builder.Services.AddSingleton<LocalLyricService>();
 
 var app = builder.Build();
 
@@ -44,6 +46,15 @@ app.MapGet("/cover/current", async (IMediaSessionService mediaSessionService, Ca
     return cover is null
         ? Results.NotFound()
         : Results.File(cover.Bytes, cover.ContentType);
+});
+
+app.MapGet("/lyrics/current", async (
+    IMediaSessionService mediaSessionService,
+    LocalLyricService lyricService,
+    CancellationToken cancellationToken) =>
+{
+    var status = await mediaSessionService.GetStatusAsync(cancellationToken);
+    return await lyricService.GetCurrentLyricsAsync(status, cancellationToken);
 });
 
 app.MapPost("/control/play-pause", async (IMediaSessionService mediaSessionService, CancellationToken cancellationToken) =>
