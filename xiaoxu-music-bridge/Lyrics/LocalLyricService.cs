@@ -131,7 +131,7 @@ public sealed class LocalLyricService
             .OrderByDescending(result => Score(result, title, artist, status.DurationMs))
             .FirstOrDefault(result => !string.IsNullOrWhiteSpace(result.SyncedLyrics) || !string.IsNullOrWhiteSpace(result.PlainLyrics));
 
-        if (best is null)
+        if (best is null || Score(best, title, artist, status.DurationMs) < 70)
         {
             return null;
         }
@@ -184,7 +184,7 @@ public sealed class LocalLyricService
         var best = songs
             .OrderByDescending(song => Score(song, title, artist, status.DurationMs))
             .FirstOrDefault(song => !string.IsNullOrWhiteSpace(song.Mid));
-        if (best is null)
+        if (best is null || Score(best, title, artist, status.DurationMs) < 80)
         {
             return null;
         }
@@ -224,6 +224,7 @@ public sealed class LocalLyricService
         var wantedTitle = Normalize(title);
         var wantedArtist = Normalize(artist);
 
+        if (!IsTitleMatch(trackName, wantedTitle)) return -1000;
         if (trackName == wantedTitle) score += 80;
         else if (trackName.Contains(wantedTitle) || wantedTitle.Contains(trackName)) score += 40;
 
@@ -285,7 +286,7 @@ public sealed class LocalLyricService
         var best = songs
             .OrderByDescending(song => Score(song, title, artist, status.DurationMs))
             .FirstOrDefault();
-        if (best is null || best.Id <= 0)
+        if (best is null || best.Id <= 0 || Score(best, title, artist, status.DurationMs) < 80)
         {
             return null;
         }
@@ -333,6 +334,7 @@ public sealed class LocalLyricService
         var wantedTitle = Normalize(title);
         var wantedArtist = Normalize(artist);
 
+        if (!IsTitleMatch(songName, wantedTitle)) return -1000;
         if (songName == wantedTitle) score += 100;
         else if (songName.Contains(wantedTitle) || wantedTitle.Contains(songName)) score += 45;
 
@@ -362,6 +364,7 @@ public sealed class LocalLyricService
         var wantedTitle = Normalize(title);
         var wantedArtist = Normalize(artist);
 
+        if (!IsTitleMatch(songName, wantedTitle)) return -1000;
         if (songName == wantedTitle) score += 100;
         else if (songName.Contains(wantedTitle) || wantedTitle.Contains(songName)) score += 45;
 
@@ -399,6 +402,15 @@ public sealed class LocalLyricService
     {
         var cleaned = Regex.Replace(value.ToLowerInvariant(), @"[^\p{L}\p{N}]+", "");
         return cleaned.Trim();
+    }
+
+    private static bool IsTitleMatch(string candidateTitle, string wantedTitle)
+    {
+        return !string.IsNullOrWhiteSpace(candidateTitle)
+            && !string.IsNullOrWhiteSpace(wantedTitle)
+            && (candidateTitle == wantedTitle
+                || candidateTitle.Contains(wantedTitle)
+                || wantedTitle.Contains(candidateTitle));
     }
 
     private static string? PlainLyricsToPseudoLrc(string? plainLyrics)

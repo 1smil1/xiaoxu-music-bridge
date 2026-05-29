@@ -268,6 +268,69 @@ public sealed class BridgeApiTests
     }
 
     [TestMethod]
+    public async Task LyricsCurrent_DoesNotReturnLowScoreNeteaseMatch()
+    {
+        var lyricsDirectory = Path.Combine(Path.GetTempPath(), $"xiaoxu-lyrics-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(lyricsDirectory);
+        try
+        {
+            var status = new MediaStatus(
+                Connected: true,
+                Source: "QQMusic",
+                Title: "太迟 (1个球版)",
+                Artist: "1个球",
+                Album: "太迟 (1个球版)",
+                CoverUrl: null,
+                IsPlaying: true,
+                PositionMs: 0,
+                DurationMs: 179494,
+                UpdatedAt: DateTimeOffset.Now);
+            var handler = new FakeHttpMessageHandler(request =>
+            {
+                var url = request.RequestUri?.ToString() ?? "";
+                if (url.Contains("lrclib.net") || url.Contains("/api/search?"))
+                {
+                    return "[]";
+                }
+
+                if (url.Contains("/api/search/get/web"))
+                {
+                    return JsonSerializer.Serialize(new
+                    {
+                        result = new
+                        {
+                            songs = new[]
+                            {
+                                new
+                                {
+                                    id = 1,
+                                    name = "咱们结婚吧",
+                                    artists = new[] { new { name = "1个球" } },
+                                    duration = 179000
+                                }
+                            }
+                        }
+                    });
+                }
+
+                return JsonSerializer.Serialize(new { lrc = new { lyric = "[00:00.00]错误歌词" } });
+            });
+            await using var factory = CreateFactory(new FakeMediaSessionService { Status = status }, lyricsDirectory, handler);
+            using var client = factory.CreateClient();
+
+            var response = await client.GetFromJsonAsync<LyricResponse>("/lyrics/current");
+
+            Assert.IsNotNull(response);
+            Assert.IsFalse(response.Found);
+        }
+        finally
+        {
+            Directory.Delete(lyricsDirectory, recursive: true);
+        }
+    }
+
+
+    [TestMethod]
     public async Task LyricsCurrent_UsesQqMusicBeforeOtherOnlineSources()
     {
         var lyricsDirectory = Path.Combine(Path.GetTempPath(), $"xiaoxu-lyrics-{Guid.NewGuid():N}");
