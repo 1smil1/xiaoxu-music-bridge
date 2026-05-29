@@ -52,6 +52,23 @@ public sealed class BridgeApiTests
     }
 
     [TestMethod]
+    public async Task CorsPreflight_AllowsPrivateNetworkAccess()
+    {
+        await using var factory = CreateFactory(new FakeMediaSessionService());
+        using var client = factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Options, "/status");
+        request.Headers.Add("Origin", "http://xiaoxu.xin");
+        request.Headers.Add("Access-Control-Request-Method", "GET");
+        request.Headers.Add("Access-Control-Request-Private-Network", "true");
+
+        var response = await client.SendAsync(request);
+
+        Assert.AreEqual(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.IsTrue(response.Headers.TryGetValues("Access-Control-Allow-Private-Network", out var values));
+        CollectionAssert.Contains(values.ToArray(), "true");
+    }
+
+    [TestMethod]
     [DataRow("/control/play-pause", ControlCommand.PlayPause)]
     [DataRow("/control/next", ControlCommand.Next)]
     [DataRow("/control/previous", ControlCommand.Previous)]

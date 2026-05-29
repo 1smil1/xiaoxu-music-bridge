@@ -21,6 +21,16 @@ builder.Services.AddSingleton<IMediaSessionService, WindowsMediaSessionService>(
 
 var app = builder.Build();
 
+app.Use(async (context, next) =>
+{
+    if (context.Request.Headers.ContainsKey("Access-Control-Request-Private-Network"))
+    {
+        context.Response.Headers["Access-Control-Allow-Private-Network"] = "true";
+    }
+
+    await next();
+});
+
 app.UseCors();
 
 app.MapGet("/health", () => new HealthResponse(true, "xiaoxu-music-bridge", "0.1.0"));
