@@ -1,7 +1,10 @@
 using System.Net;
+using System.Text;
+using System.Text.Json;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using xiaoxu_music_bridge.Media;
 
 namespace xiaoxu_music_bridge.Tests;
@@ -125,6 +128,8 @@ public sealed class BridgeApiTests
             Assert.IsNotNull(response);
             Assert.IsTrue(response.Found);
             Assert.AreEqual("兰音Reine - 云月谣.lrc", response.FileName);
+            Assert.AreEqual("local", response.Source);
+            Assert.IsTrue(response.Synced);
             StringAssert.Contains(response.Lrc, "星河落下");
         }
         finally
@@ -132,6 +137,203 @@ public sealed class BridgeApiTests
             Directory.Delete(lyricsDirectory, recursive: true);
         }
     }
+
+    [TestMethod]
+    public async Task LyricsCurrent_FetchesSyncedLyricsFromLrclibWhenLocalFileIsMissing()
+    {
+        var lyricsDirectory = Path.Combine(Path.GetTempPath(), $"xiaoxu-lyrics-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(lyricsDirectory);
+        try
+        {
+            var status = new MediaStatus(
+                Connected: true,
+                Source: "QQMusic",
+                Title: "See You in Life",
+                Artist: "Valentina Ploy",
+                Album: "Satellite",
+                CoverUrl: null,
+                IsPlaying: true,
+                PositionMs: 0,
+                DurationMs: 241749,
+                UpdatedAt: DateTimeOffset.Now);
+            var lyricsPayload = JsonSerializer.Serialize(new[]
+            {
+                new
+                {
+                    trackName = "See You in Life",
+                    artistName = "Valentina Ploy",
+                    albumName = "Satellite",
+                    duration = 242,
+                    plainLyrics = "See you in life",
+                    syncedLyrics = "[00:01.00]See you in life\n[00:03.00]Under the satellite"
+                }
+            });
+            await using var factory = CreateFactory(
+                new FakeMediaSessionService { Status = status },
+                lyricsDirectory,
+                new FakeHttpMessageHandler(lyricsPayload));
+            using var client = factory.CreateClient();
+
+            var response = await client.GetFromJsonAsync<LyricResponse>("/lyrics/current");
+
+            Assert.IsNotNull(response);
+            Assert.IsTrue(response.Found);
+            Assert.AreEqual("lrclib-synced", response.Source);
+            Assert.IsTrue(response.Synced);
+            StringAssert.Contains(response.Lrc, "[00:01.00]See you in life");
+        }
+        finally
+        {
+            Directory.Delete(lyricsDirectory, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task LyricsCurrent_FallsBackToNeteaseForChineseLyrics()
+    {
+        var lyricsDirectory = Path.Combine(Path.GetTempPath(), $"xiaoxu-lyrics-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(lyricsDirectory);
+        try
+        {
+            var status = new MediaStatus(
+                Connected: true,
+                Source: "QQMusic",
+                Title: "虚情假意",
+                Artist: "蓝心羽",
+                Album: "虚情假意",
+                CoverUrl: null,
+                IsPlaying: true,
+                PositionMs: 0,
+                DurationMs: 188223,
+                UpdatedAt: DateTimeOffset.Now);
+            var handler = new FakeHttpMessageHandler(request =>
+            {
+                var url = request.RequestUri?.ToString() ?? "";
+                if (url.Contains("lrclib.net"))
+                {
+                    return "[]";
+                }
+
+                if (url.Contains("/api/search/get/web"))
+                {
+                    return JsonSerializer.Serialize(new
+                    {
+                        result = new
+                        {
+                            songs = new[]
+                            {
+                                new
+                                {
+                                    id = 1954914405,
+                                    name = "虚情假意 (伴奏)",
+                                    artists = new[] { new { name = "蓝心羽" } },
+                                    duration = 188000
+                                },
+                                new
+                                {
+                                    id = 1954914404,
+                                    name = "虚情假意",
+                                    artists = new[] { new { name = "蓝心羽" } },
+                                    duration = 188000
+                                }
+                            }
+                        }
+                    });
+                }
+
+                return JsonSerializer.Serialize(new
+                {
+                    lrc = new
+                    {
+                        lyric = "[00:04.47]怀念那时的我们 纯真无邪的脸\n[00:08.44]怀念天真的过去 说要到永远"
+                    }
+                });
+            });
+            await using var factory = CreateFactory(new FakeMediaSessionService { Status = status }, lyricsDirectory, handler);
+            using var client = factory.CreateClient();
+
+            var response = await client.GetFromJsonAsync<LyricResponse>("/lyrics/current");
+
+            Assert.IsNotNull(response);
+            Assert.IsTrue(response.Found);
+            Assert.AreEqual("netease", response.Source);
+            Assert.IsTrue(response.Synced);
+            Assert.AreEqual("蓝心羽 - 虚情假意", response.FileName);
+            StringAssert.Contains(response.Lrc, "怀念那时的我们");
+        }
+        finally
+        {
+            Directory.Delete(lyricsDirectory, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task LyricsCurrent_UsesQqMusicBeforeOtherOnlineSources()
+    {
+        var lyricsDirectory = Path.Combine(Path.GetTempPath(), $"xiaoxu-lyrics-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(lyricsDirectory);
+        try
+        {
+            var status = new MediaStatus(
+                Connected: true,
+                Source: "QQMusic",
+                Title: "半抹烟熏",
+                Artist: "封茗囧菌",
+                Album: "半抹烟熏",
+                CoverUrl: null,
+                IsPlaying: true,
+                PositionMs: 0,
+                DurationMs: 223914,
+                UpdatedAt: DateTimeOffset.Now);
+            var handler = new FakeHttpMessageHandler(request =>
+            {
+                var url = request.RequestUri?.ToString() ?? "";
+                if (url.Contains("/api/search"))
+                {
+                    return JsonSerializer.Serialize(new
+                    {
+                        data = new
+                        {
+                            list = new[]
+                            {
+                                new
+                                {
+                                    mid = "001abc",
+                                    title = "半抹烟熏",
+                                    singer = new[] { new { name = "封茗囧菌" } },
+                                    interval = 224
+                                }
+                            }
+                        }
+                    });
+                }
+
+                return JsonSerializer.Serialize(new
+                {
+                    data = new
+                    {
+                        lyric = "[00:17.10]路人四下张望 谁丢的姑娘\n[00:20.54]化了半边的妆"
+                    }
+                });
+            });
+            await using var factory = CreateFactory(new FakeMediaSessionService { Status = status }, lyricsDirectory, handler);
+            using var client = factory.CreateClient();
+
+            var response = await client.GetFromJsonAsync<LyricResponse>("/lyrics/current");
+
+            Assert.IsNotNull(response);
+            Assert.IsTrue(response.Found);
+            Assert.AreEqual("qqmusic", response.Source);
+            Assert.IsTrue(response.Synced);
+            Assert.AreEqual("封茗囧菌 - 半抹烟熏", response.FileName);
+            StringAssert.Contains(response.Lrc, "路人四下张望");
+        }
+        finally
+        {
+            Directory.Delete(lyricsDirectory, recursive: true);
+        }
+    }
+
 
     private static WebApplicationFactory<Program> CreateFactory(IMediaSessionService mediaSessionService)
     {
@@ -154,6 +356,25 @@ public sealed class BridgeApiTests
                 builder.ConfigureServices(services =>
                 {
                     services.AddSingleton(mediaSessionService);
+                });
+            });
+    }
+
+    private static WebApplicationFactory<Program> CreateFactory(
+        IMediaSessionService mediaSessionService,
+        string lyricsDirectory,
+        HttpMessageHandler lyricsHttpMessageHandler)
+    {
+        return new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.UseSetting("Lyrics:Directory", lyricsDirectory);
+                builder.ConfigureServices(services =>
+                {
+                    services.AddSingleton(mediaSessionService);
+                    services.RemoveAll<HttpClient>();
+                    services.AddHttpClient<xiaoxu_music_bridge.Lyrics.LocalLyricService>()
+                        .ConfigurePrimaryHttpMessageHandler(() => lyricsHttpMessageHandler);
                 });
             });
     }
@@ -182,5 +403,30 @@ public sealed class BridgeApiTests
 
     private sealed record HealthResponse(bool Ok, string Name, string Version);
     private sealed record ControlResponse(bool Ok);
-    private sealed record LyricResponse(bool Found, string? Title, string? Artist, string? FileName, string? Lrc);
+    private sealed record LyricResponse(bool Found, string? Title, string? Artist, string? FileName, string? Lrc, string? Source, bool Synced);
+
+    private sealed class FakeHttpMessageHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, string> _responseFactory;
+
+        public FakeHttpMessageHandler(string responseBody)
+            : this(_ => responseBody)
+        {
+        }
+
+        public FakeHttpMessageHandler(Func<HttpRequestMessage, string> responseFactory)
+        {
+            _responseFactory = responseFactory;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(_responseFactory(request), Encoding.UTF8, "application/json")
+            };
+
+            return Task.FromResult(response);
+        }
+    }
 }

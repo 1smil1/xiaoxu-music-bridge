@@ -19,7 +19,10 @@ builder.Services.AddCors(options =>
     });
 });
 builder.Services.AddSingleton<IMediaSessionService, WindowsMediaSessionService>();
-builder.Services.AddSingleton<LocalLyricService>();
+builder.Services.AddHttpClient<LocalLyricService>(client =>
+{
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("xiaoxu-music-bridge/0.1.0");
+});
 
 var app = builder.Build();
 

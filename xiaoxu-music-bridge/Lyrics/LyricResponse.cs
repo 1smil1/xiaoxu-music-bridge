@@ -5,4 +5,6 @@ public sealed record LyricResponse(
     string? Title,
     string? Artist,
     string? FileName,
-    string? Lrc);
+    string? Lrc,
+    string? Source = null,
+    bool Synced = false);
