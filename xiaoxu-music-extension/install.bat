@@ -49,8 +49,23 @@ echo.
 :: Kill any existing host process
 taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
 
-:: Generate host manifest using Python (avoids PowerShell escaping issues)
-python -c "import json; f=open(r'%INSTALL_DIR%\xiaoxu_music_host.json','w'); json.dump({'name':'xiaoxu_music_host','description':'xiaoxu-music-bridge native messaging host','path':r'%INSTALL_DIR%\xiaoxu-music-host.exe','type':'stdio','allowed_origins':['chrome-extension://%EXT_ID%/']},f,indent=2); f.close()"
+:: Generate host manifest via a temp PS1 script (avoids inline escaping nightmares)
+set "PS1_FILE=%INSTALL_DIR%\_gen_json.ps1"
+(
+echo $dir = '%INSTALL_DIR%'
+echo $exe = Join-Path $dir 'xiaoxu-music-host.exe'
+echo $id = '%EXT_ID%'
+echo $obj = @{
+echo     name = 'xiaoxu_music_host'
+echo     path = $exe
+echo     type = 'stdio'
+echo     allowed_origins = @("chrome-extension://$id/")
+echo }
+echo $json = $obj | ConvertTo-Json -Compress
+echo [System.IO.File]::WriteAllText((Join-Path $dir 'xiaoxu_music_host.json'^), $json)
+) > "%PS1_FILE%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1_FILE%"
+del /f /q "%PS1_FILE%" >nul 2>&1
 
 if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
     echo  error: failed to generate xiaoxu_music_host.json
