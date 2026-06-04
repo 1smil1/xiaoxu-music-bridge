@@ -49,19 +49,8 @@ echo.
 :: Kill any existing host process
 taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
 
-:: Write registry
-reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
-if %errorlevel% neq 0 (
-    echo  error: registry write failed
-    pause
-    exit /b 1
-)
-
-:: Generate host manifest
-set "EXE_PATH=%INSTALL_DIR%\xiaoxu-music-host.exe"
-set "EXE_PATH_JSON=%EXE_PATH:\=\\%"
-
-powershell -Command "$j = '{ \"path\": \"%EXE_PATH_JSON%\", \"name\": \"xiaoxu_music_host\", \"allowed_origins\": [\"chrome-extension://%EXT_ID%/\"], \"type\": \"stdio\" }'; [System.IO.File]::WriteAllText('%INSTALL_DIR%\xiaoxu_music_host.json', $j)"
+:: Generate host manifest using Python (avoids PowerShell escaping issues)
+python -c "import json; f=open(r'%INSTALL_DIR%\xiaoxu_music_host.json','w'); json.dump({'name':'xiaoxu_music_host','description':'xiaoxu-music-bridge native messaging host','path':r'%INSTALL_DIR%\xiaoxu-music-host.exe','type':'stdio','allowed_origins':['chrome-extension://%EXT_ID%/']},f,indent=2); f.close()"
 
 if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
     echo  error: failed to generate xiaoxu_music_host.json
@@ -69,7 +58,11 @@ if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
     exit /b 1
 )
 
-echo  [OK] 注册表已写入
+:: Write registry (both HKCU and HKLM for reliability)
+reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
+reg add "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
+
+echo  [OK] 注册表已写入 (HKCU + HKLM)
 echo  [OK] host manifest 已生成
 echo.
 
