@@ -29,6 +29,7 @@ window.addEventListener('message', (e) => {
       }
 
       window.postMessage({
+        _bridgeFetchResponse: true,
         _bridgeFetchId: e.data._bridgeFetchId,
         ...response,
       }, '*');

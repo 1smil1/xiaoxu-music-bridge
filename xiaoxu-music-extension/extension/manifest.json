@@ -4,7 +4,8 @@
   "version": "1.0.0",
   "description": "桥接本地音乐播放器到 xiaoxu.xin 壁纸页面",
   "permissions": [
-    "nativeMessaging"
+    "nativeMessaging",
+    "storage"
   ],
   "host_permissions": [
     "*://xiaoxu.xin/*"
