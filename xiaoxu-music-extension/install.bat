@@ -56,31 +56,15 @@ taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
 echo  [2/4] OK
 echo.
 
-:: Step 2: Generate host manifest
+:: Step 2: Generate host manifest (ConvertTo-Json handles backslash escaping)
 echo  [3/4] Generating xiaoxu_music_host.json ...
-set "PS1_FILE=%INSTALL_DIR%\_gen_json.ps1"
-(
-echo $dir = '%INSTALL_DIR%'
-echo $exe = Join-Path $dir 'xiaoxu-music-host.exe'
-echo $id = '%EXT_ID%'
-echo $obj = @{
-echo     name = 'xiaoxu_music_host'
-echo     path = $exe
-echo     type = 'stdio'
-echo     allowed_origins = @("chrome-extension://$id/")
-echo }
-echo $json = $obj ^| ConvertTo-Json -Compress
-echo [System.IO.File]::WriteAllText((Join-Path $dir 'xiaoxu_music_host.json'^), $json)
-) > "%PS1_FILE%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1_FILE%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$j = @{name='xiaoxu_music_host';path='%INSTALL_DIR%\xiaoxu-music-host.exe';type='stdio';allowed_origins=@('chrome-extension://%EXT_ID%/')} | ConvertTo-Json -Compress; [System.IO.File]::WriteAllText('%INSTALL_DIR%\xiaoxu_music_host.json', $j)" >nul 2>&1
 if %errorlevel% neq 0 (
     echo  [3/4] FAILED - PowerShell error
-    del /f /q "%PS1_FILE%" >nul 2>&1
     echo.
     pause
     exit /b 1
 )
-del /f /q "%PS1_FILE%" >nul 2>&1
 
 if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
     echo  [3/4] FAILED - json file not created
