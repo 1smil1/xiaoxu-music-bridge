@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul 2>&1
-title xiaoxu-music-bridge
+title xiaoxu-music-bridge 安装
 
 echo.
 echo  ========================================
@@ -11,45 +11,53 @@ echo  注意：安装过程中会关闭所有 Chrome 窗口
 echo  请先保存 Chrome 中的工作
 echo.
 pause
+echo.
 
 set "INSTALL_DIR=%~dp0"
 set "INSTALL_DIR=%INSTALL_DIR:~0,-1%"
 
+:: Check files
 if not exist "%INSTALL_DIR%\xiaoxu-music-host.exe" (
-    echo  error: xiaoxu-music-host.exe not found
+    echo  [ERROR] xiaoxu-music-host.exe not found
+    echo.
     pause
     exit /b 1
 )
 if not exist "%INSTALL_DIR%\extension\manifest.json" (
-    echo  error: extension\manifest.json not found
+    echo  [ERROR] extension\manifest.json not found
+    echo.
+    pause
+    exit /b 1
+)
+if not exist "%INSTALL_DIR%\EXTENSION_ID.txt" (
+    echo  [ERROR] EXTENSION_ID.txt not found
+    echo.
     pause
     exit /b 1
 )
 
-set "EXT_ID_FILE=%INSTALL_DIR%\EXTENSION_ID.txt"
-if not exist "%EXT_ID_FILE%" (
-    echo  error: EXTENSION_ID.txt not found
-    pause
-    exit /b 1
-)
-
-set /p EXT_ID= < "%EXT_ID_FILE%"
+set /p EXT_ID= < "%INSTALL_DIR%\EXTENSION_ID.txt"
 set "EXT_ID=%EXT_ID: =%"
 
 if "%EXT_ID%"=="" (
-    echo  error: EXTENSION_ID.txt is empty
+    echo  [ERROR] EXTENSION_ID.txt is empty
+    echo.
     pause
     exit /b 1
 )
 
-echo  Extension ID: %EXT_ID%
-echo  Install path: %INSTALL_DIR%
+echo  [1/4] Extension ID: %EXT_ID%
+echo  [1/4] Install path: %INSTALL_DIR%
 echo.
 
-:: Kill any existing host process
+:: Step 1: Kill existing host process
+echo  [2/4] Killing existing host process...
 taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
+echo  [2/4] OK
+echo.
 
-:: Generate host manifest via a temp PS1 script (avoids inline escaping nightmares)
+:: Step 2: Generate host manifest
+echo  [3/4] Generating xiaoxu_music_host.json ...
 set "PS1_FILE=%INSTALL_DIR%\_gen_json.ps1"
 (
 echo $dir = '%INSTALL_DIR%'
@@ -61,28 +69,37 @@ echo     path = $exe
 echo     type = 'stdio'
 echo     allowed_origins = @("chrome-extension://$id/")
 echo }
-echo $json = $obj | ConvertTo-Json -Compress
+echo $json = $obj ^| ConvertTo-Json -Compress
 echo [System.IO.File]::WriteAllText((Join-Path $dir 'xiaoxu_music_host.json'^), $json)
 ) > "%PS1_FILE%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1_FILE%"
-del /f /q "%PS1_FILE%" >nul 2>&1
-
-if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
-    echo  error: failed to generate xiaoxu_music_host.json
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1_FILE%" 2>&1
+if %errorlevel% neq 0 (
+    echo  [3/4] FAILED - PowerShell error
+    del /f /q "%PS1_FILE%" >nul 2>&1
+    echo.
     pause
     exit /b 1
 )
+del /f /q "%PS1_FILE%" >nul 2>&1
 
-:: Write registry (both HKCU and HKLM for reliability)
-reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
-reg add "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
-
-echo  [OK] 注册表已写入 (HKCU + HKLM)
-echo  [OK] host manifest 已生成
+if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
+    echo  [3/4] FAILED - json file not created
+    echo.
+    pause
+    exit /b 1
+)
+echo  [3/4] OK
 echo.
 
-:: Close Chrome to flush native messaging host cache
-echo  正在关闭 Chrome ...
+:: Step 3: Write registry
+echo  [4/4] Writing registry ...
+reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
+reg add "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
+echo  [4/4] OK (HKCU + HKLM)
+echo.
+
+:: Step 4: Restart Chrome
+echo  Closing Chrome ...
 taskkill /F /IM chrome.exe >nul 2>&1
 timeout /t 2 /nobreak >nul
 
@@ -91,20 +108,21 @@ echo  ========================================
 echo     安装完成
 echo  ========================================
 echo.
-echo  Chrome 正在重新启动，请稍等...
-echo  启动后：
+echo  Chrome 正在重新启动...
+echo  启动后请：
 echo  1. 打开 chrome://extensions
 echo  2. 开启开发者模式
-echo  3. 点击"加载已解压的扩展程序"选择: %INSTALL_DIR%\extension
+echo  3. 点击"加载已解压的扩展程序"选择:
+echo     %INSTALL_DIR%\extension
 echo.
 
-:: Restart Chrome — try common paths
 if exist "C:\Program Files\Google\Chrome\Application\chrome.exe" (
     start "" "C:\Program Files\Google\Chrome\Application\chrome.exe"
 ) else if exist "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" (
     start "" "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
 ) else (
-    echo  [warn] 未找到 Chrome，请手动启动 Chrome
+    echo  [WARN] 未找到 Chrome，请手动启动
 )
 
-pause
+echo  按任意键关闭此窗口...
+pause >nul
