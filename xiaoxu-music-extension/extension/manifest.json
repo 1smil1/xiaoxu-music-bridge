@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "xiaoxu-music-bridge",
+  "version": "1.0.0",
+  "description": "桥接本地音乐播放器到 xiaoxu.xin 壁纸页面",
+  "permissions": [
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "*://xiaoxu.xin/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://xiaoxu.xin/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["*://xiaoxu.xin/*"]
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
