@@ -11,10 +11,25 @@ function connectHost() {
 
   try {
     host = chrome.runtime.connectNative(HOST_NAME);
+    console.log('[xiaoxu-music] connectNative SUCCESS, extension ID:', chrome.runtime.id);
   } catch (e) {
-    console.error('[xiaoxu-music] connectNative failed:', e.message);
+    const err = chrome.runtime.lastError;
+    console.error('[xiaoxu-music] connectNative THROW, lastError:', err?.message, 'exception:', e.message,
+      'extension ID:', chrome.runtime.id);
     return null;
   }
+
+  // Check immediate disconnect (e.g. host not found, exe crash)
+  host.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError;
+    console.error('[xiaoxu-music] native host DISCONNECTED immediately, lastError:', err?.message,
+      'extension ID:', chrome.runtime.id);
+    host = null;
+    for (const [id, { reject }] of pending) {
+      pending.delete(id);
+      reject(new Error(err?.message || 'Native host disconnected'));
+    }
+  });
 
   host.onMessage.addListener((message) => {
     const id = message._id;
@@ -22,14 +37,6 @@ function connectHost() {
       const { resolve, reject } = pending.get(id);
       pending.delete(id);
       resolve(message);
-    }
-  });
-
-  host.onDisconnect.addListener(() => {
-    host = null;
-    for (const [id, { reject }] of pending) {
-      pending.delete(id);
-      reject(new Error('Native host disconnected'));
     }
   });
 
