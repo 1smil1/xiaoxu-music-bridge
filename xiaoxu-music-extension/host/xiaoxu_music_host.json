@@ -1,0 +1,9 @@
+{
+  "name": "xiaoxu_music_host",
+  "description": "xiaoxu-music-bridge native messaging host for Chrome",
+  "path": "xiaoxu-music-host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://hofjlkkajllpfhmihmallcidligfpgak/"
+  ]
+}

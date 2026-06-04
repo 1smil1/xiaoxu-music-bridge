@@ -1,6 +1,17 @@
+using System.Net.Sockets;
 using xiaoxu_music_bridge.Lyrics;
 using xiaoxu_music_bridge.Media;
+using xiaoxu_music_bridge.UI;
 
+// ① Network connectivity check (TCP connect xiaoxu.xin:80, 5s timeout)
+if (!await CheckNetworkConnectivityAsync())
+{
+    ApplicationConfiguration.Initialize();
+    Application.Run(new MainForm(networkError: true));
+    return;
+}
+
+// ② Build Web Application (original logic)
 var builder = WebApplication.CreateBuilder(args);
 
 builder.WebHost.UseUrls("http://127.0.0.1:17888");
@@ -69,8 +80,17 @@ app.MapPost("/control/next", async (IMediaSessionService mediaSessionService, Ca
 app.MapPost("/control/previous", async (IMediaSessionService mediaSessionService, CancellationToken cancellationToken) =>
     ToHttpResult(await mediaSessionService.SendCommandAsync(ControlCommand.Previous, cancellationToken)));
 
-app.Run();
+// ③ Start Kestrel in background (non-blocking)
+await app.StartAsync();
 
+// ④ Start WinForms (blocks until user exits)
+ApplicationConfiguration.Initialize();
+Application.Run(new MainForm());
+
+// ⑤ Graceful shutdown of web service
+await app.StopAsync();
+
+// Static helpers
 static IResult ToHttpResult(ControlResult result)
 {
     return result.Ok
@@ -78,8 +98,22 @@ static IResult ToHttpResult(ControlResult result)
         : Results.Problem(result.Error ?? "Media command failed", statusCode: StatusCodes.Status503ServiceUnavailable);
 }
 
+static async Task<bool> CheckNetworkConnectivityAsync()
+{
+    try
+    {
+        using var client = new TcpClient();
+        var connectTask = client.ConnectAsync("xiaoxu.xin", 80);
+        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+        var completedTask = await Task.WhenAny(connectTask, timeoutTask);
+        return completedTask == connectTask && client.Connected;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
 internal sealed record HealthResponse(bool Ok, string Name, string Version);
-
 internal sealed record ControlResponse(bool Ok);
-
 public partial class Program;
