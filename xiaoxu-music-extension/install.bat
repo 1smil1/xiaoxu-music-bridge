@@ -3,8 +3,14 @@ chcp 65001 >nul 2>&1
 title xiaoxu-music-bridge
 
 echo.
-echo  xiaoxu-music-bridge
+echo  ========================================
+echo     xiaoxu-music-bridge  安装
+echo  ========================================
 echo.
+echo  注意：安装过程中会关闭所有 Chrome 窗口
+echo  请先保存 Chrome 中的工作
+echo.
+pause
 
 set "INSTALL_DIR=%~dp0"
 set "INSTALL_DIR=%INSTALL_DIR:~0,-1%"
@@ -40,6 +46,10 @@ echo  Extension ID: %EXT_ID%
 echo  Install path: %INSTALL_DIR%
 echo.
 
+:: Kill any existing host process
+taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
+
+:: Write registry
 reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
 if %errorlevel% neq 0 (
     echo  error: registry write failed
@@ -47,6 +57,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+:: Generate host manifest
 set "EXE_PATH=%INSTALL_DIR%\xiaoxu-music-host.exe"
 set "EXE_PATH_JSON=%EXE_PATH:\=\\%"
 
@@ -58,14 +69,34 @@ if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
     exit /b 1
 )
 
-echo  registry: OK
-echo  manifest: OK
+echo  [OK] 注册表已写入
+echo  [OK] host manifest 已生成
 echo.
-echo  Done.
+
+:: Close Chrome to flush native messaging host cache
+echo  正在关闭 Chrome ...
+taskkill /F /IM chrome.exe >nul 2>&1
+timeout /t 2 /nobreak >nul
+
 echo.
-echo  Next step:
-echo  1. Open chrome://extensions
-echo  2. Enable Developer mode
-echo  3. Click "Load unpacked" and select: %INSTALL_DIR%\extension
+echo  ========================================
+echo     安装完成
+echo  ========================================
 echo.
+echo  Chrome 正在重新启动，请稍等...
+echo  启动后：
+echo  1. 打开 chrome://extensions
+echo  2. 开启开发者模式
+echo  3. 点击"加载已解压的扩展程序"选择: %INSTALL_DIR%\extension
+echo.
+
+:: Restart Chrome — try common paths
+if exist "C:\Program Files\Google\Chrome\Application\chrome.exe" (
+    start "" "C:\Program Files\Google\Chrome\Application\chrome.exe"
+) else if exist "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" (
+    start "" "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+) else (
+    echo  [warn] 未找到 Chrome，请手动启动 Chrome
+)
+
 pause
