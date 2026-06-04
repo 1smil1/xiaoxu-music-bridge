@@ -15,12 +15,12 @@
       return new Promise((resolve, reject) => {
         const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
         const handler = (e) => {
-          if (e.data && e.data._bridgeFetchId === id) {
+          if (e.data && e.data._bridgeFetchResponse && e.data._bridgeFetchId === id) {
             window.removeEventListener('message', handler);
             if (e.data.error) {
               reject(new TypeError(e.data.error));
             } else {
-              const respBody = e.data.body;
+              const respBody = typeof e.data.data === 'string' ? e.data.data : JSON.stringify(e.data.data);
               const respStatus = e.data.status || 200;
               resolve(new Response(respBody, {
                 status: respStatus,

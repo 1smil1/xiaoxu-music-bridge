@@ -12,7 +12,7 @@ function connectHost() {
   try {
     host = chrome.runtime.connectNative(HOST_NAME);
   } catch (e) {
-    console.error('[xiaoxu-music] Failed to connect native host:', e);
+    console.error('[xiaoxu-music] connectNative failed:', e.message);
     return null;
   }
 
@@ -26,7 +26,6 @@ function connectHost() {
   });
 
   host.onDisconnect.addListener(() => {
-    console.warn('[xiaoxu-music] Native host disconnected');
     host = null;
     for (const [id, { reject }] of pending) {
       pending.delete(id);
@@ -60,6 +59,8 @@ function sendToHost(message) {
 }
 
 // Handle messages from content script
+// NOTE: sendResponse passes the native host response object directly (no JSON.stringify)
+// to avoid Chrome's sendMessage string-in-object truncation issue.
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type !== 'bridgeRequest') return false;
 
@@ -68,7 +69,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   try {
     pathname = new URL(url).pathname;
   } catch {
-    sendResponse({ ok: false, status: 400, body: '{}' });
+    sendResponse({ ok: false, status: 400, data: { error: 'bad url' } });
     return false;
   }
 
@@ -82,37 +83,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (pathname === '/lyrics/current') {
     hostMessage = { type: 'getLyrics' };
   } else if (pathname === '/cover/current') {
-    hostMessage = { type: 'getCover' };
+    // Cover cached in session storage — return dataUrl directly as object field
+    chrome.storage.session.get('coverDataUrl', (result) => {
+      sendResponse({ ok: true, status: 200, data: { type: 'cover', dataUrl: result.coverDataUrl || null } });
+    });
+    return true;
   } else if (pathname === '/health') {
-    sendResponse({ ok: true, status: 200, body: JSON.stringify({ ok: true, name: 'xiaoxu-music-bridge-extension', version: '1.0.0' }) });
+    sendResponse({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '1.0.0' } });
     return false;
   } else {
-    sendResponse({ ok: false, status: 404, body: '{}' });
+    sendResponse({ ok: false, status: 404, data: {} });
     return false;
   }
 
   sendToHost(hostMessage)
     .then((response) => {
-      // If status response has a coverUrl, we need to also fetch the cover
-      // and convert it to a data URL (since there's no HTTP server anymore).
-      if (response.type === 'status' && response.coverUrl) {
+      if (response.type === 'status' && response.hasCover) {
         return sendToHost({ type: 'getCover' }).then((cover) => {
           if (cover.data) {
-            response.coverUrl = `data:${cover.contentType};base64,${cover.data}`;
+            const dataUrl = `data:${cover.contentType};base64,${cover.data}`;
+            chrome.storage.session.set({ coverDataUrl: dataUrl });
+            response.coverUrl = 'cover:ready';
           } else {
+            chrome.storage.session.set({ coverDataUrl: null });
             response.coverUrl = null;
           }
-          sendResponse({ ok: true, status: 200, body: JSON.stringify(response) });
+          sendResponse({ ok: true, status: 200, data: response });
         });
       }
-
-      const body = JSON.stringify(response);
+      if (response.type === 'status' && !response.hasCover) {
+        chrome.storage.session.set({ coverDataUrl: null });
+      }
       const ok = response.type !== 'error';
-      sendResponse({ ok, status: ok ? 200 : 503, body });
+      sendResponse({ ok, status: ok ? 200 : 503, data: response });
     })
     .catch((err) => {
-      sendResponse({ ok: false, status: 503, body: JSON.stringify({ error: err.message }) });
+      sendResponse({ ok: false, status: 503, data: { error: err.message } });
     });
 
-  return true; // async sendResponse
+  return true;
 });
