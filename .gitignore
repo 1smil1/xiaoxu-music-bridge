@@ -7,3 +7,7 @@ publish/
 *.user
 *.suo
 
+
+# 隐藏除 README.md 外的所有 .md 文件
+*.md
+!README.md
