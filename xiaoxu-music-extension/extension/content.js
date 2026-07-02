@@ -3,6 +3,17 @@
 
 console.log('[xiaoxu-music] content script loaded, url:', location.href);
 
+function postBridgeError(fetchId, message) {
+  window.postMessage({
+    _bridgeFetchResponse: true,
+    _bridgeFetchId: fetchId,
+    ok: false,
+    status: 503,
+    error: message,
+    data: { error: message },
+  }, '*');
+}
+
 // Inject the fetch interceptor into the PAGE context via script.src (bypasses CSP)
 const script = document.createElement('script');
 script.src = chrome.runtime.getURL('injected.js');
@@ -16,23 +27,27 @@ window.addEventListener('message', (e) => {
 
   console.log('[xiaoxu-music] BRIDGE_FETCH received:', e.data.url, e.data.method);
 
-  chrome.runtime.sendMessage(
-    { type: 'bridgeRequest', url: e.data.url, method: e.data.method },
-    (response) => {
-      console.log('[xiaoxu-music] sendMessage callback, lastError:', chrome.runtime.lastError?.message, 'response:', response);
-      if (chrome.runtime.lastError) {
-        window.postMessage({
-          _bridgeFetchId: e.data._bridgeFetchId,
-          error: chrome.runtime.lastError.message,
-        }, '*');
-        return;
-      }
+  try {
+    chrome.runtime.sendMessage(
+      { type: 'bridgeRequest', url: e.data.url, method: e.data.method },
+      (response) => {
+        const lastError = chrome.runtime.lastError;
+        console.log('[xiaoxu-music] sendMessage callback, lastError:', lastError?.message, 'response:', response);
+        if (lastError) {
+          postBridgeError(e.data._bridgeFetchId, lastError.message || 'Extension runtime unavailable');
+          return;
+        }
 
-      window.postMessage({
-        _bridgeFetchResponse: true,
-        _bridgeFetchId: e.data._bridgeFetchId,
-        ...response,
-      }, '*');
-    }
-  );
+        window.postMessage({
+          _bridgeFetchResponse: true,
+          _bridgeFetchId: e.data._bridgeFetchId,
+          ...response,
+        }, '*');
+      }
+    );
+  } catch (error) {
+    const message = error && typeof error.message === 'string' ? error.message : 'Extension runtime unavailable';
+    console.warn('[xiaoxu-music] sendMessage failed:', message);
+    postBridgeError(e.data._bridgeFetchId, message);
+  }
 });
