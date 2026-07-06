@@ -11,3 +11,8 @@ publish/
 # 隐藏除 README.md 外的所有 .md 文件
 *.md
 !README.md
+
+# Build artifacts and signing keys — never commit
+*.exe
+*.pem
+*.der

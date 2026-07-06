@@ -1,132 +1,81 @@
-// background.js — Chrome extension service worker
-// Connects to native messaging host and relays messages between content script and host.
+// background.js — Chrome MV3 service worker
+// Lifecycle manager for xiaoxu-music-host.exe.
+// The page fetches http://localhost:17888/state/current directly over HTTP;
+// this SW only spawns the host on page-load and stops it on page-close.
 
 const HOST_NAME = 'xiaoxu_music_host';
-let host = null;
-let requestId = 0;
-const pending = new Map();
+let hostPort = null;
+let keepAlive = null;
 
-function connectHost() {
-  if (host) return host;
+function startHost() {
+  if (hostPort) return true;
 
   try {
-    host = chrome.runtime.connectNative(HOST_NAME);
-    console.log('[xiaoxu-music] connectNative SUCCESS, extension ID:', chrome.runtime.id);
+    hostPort = chrome.runtime.connectNative(HOST_NAME);
   } catch (e) {
+    hostPort = null;
+    return false;
+  }
+
+  hostPort.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError;
-    console.error('[xiaoxu-music] connectNative THROW, lastError:', err?.message, 'exception:', e.message,
-      'extension ID:', chrome.runtime.id);
-    return null;
-  }
-
-  // Check immediate disconnect (e.g. host not found, exe crash)
-  host.onDisconnect.addListener(() => {
-    const err = chrome.runtime.lastError;
-    console.error('[xiaoxu-music] native host DISCONNECTED immediately, lastError:', err?.message,
-      'extension ID:', chrome.runtime.id);
-    host = null;
-    for (const [id, { reject }] of pending) {
-      pending.delete(id);
-      reject(new Error(err?.message || 'Native host disconnected'));
-    }
+    console.warn('[xiaoxu-music] native host disconnected:', err?.message || 'unknown');
+    hostPort = null;
+    if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
   });
 
-  host.onMessage.addListener((message) => {
-    const id = message._id;
-    if (id !== undefined && pending.has(id)) {
-      const { resolve, reject } = pending.get(id);
-      pending.delete(id);
-      resolve(message);
+  // 25s ping: keeps SW alive (MV3 30s timeout) + detects host crashes.
+  keepAlive = setInterval(() => {
+    if (!hostPort) return;
+    try {
+      hostPort.postMessage({ type: 'ping' });
+    } catch (e) {
+      hostPort = null;
+      clearInterval(keepAlive);
+      keepAlive = null;
     }
-  });
-
-  return host;
-}
-
-function sendToHost(message) {
-  return new Promise((resolve, reject) => {
-    const h = connectHost();
-    if (!h) {
-      reject(new Error('Cannot connect to native host'));
-      return;
-    }
-
-    const id = ++requestId;
-    pending.set(id, { resolve, reject });
-    h.postMessage({ ...message, _id: id });
-
-    // Timeout after 10s
-    setTimeout(() => {
-      if (pending.has(id)) {
-        pending.delete(id);
-        reject(new Error('Native host response timeout'));
-      }
-    }, 10000);
-  });
-}
-
-// Handle messages from content script
-// NOTE: sendResponse passes the native host response object directly (no JSON.stringify)
-// to avoid Chrome's sendMessage string-in-object truncation issue.
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type !== 'bridgeRequest') return false;
-
-  const url = message.url || '';
-  let pathname = '';
-  try {
-    pathname = new URL(url).pathname;
-  } catch {
-    sendResponse({ ok: false, status: 400, data: { error: 'bad url' } });
-    return false;
-  }
-
-  let hostMessage;
-
-  if (pathname === '/status' || pathname === '/api/status') {
-    hostMessage = { type: 'getStatus' };
-  } else if (pathname.startsWith('/control/')) {
-    const cmd = pathname.split('/').pop();
-    hostMessage = { type: 'control', command: cmd };
-  } else if (pathname === '/lyrics/current') {
-    hostMessage = { type: 'getLyrics' };
-  } else if (pathname === '/cover/current') {
-    // Cover cached in session storage — return dataUrl directly as object field
-    chrome.storage.session.get('coverDataUrl', (result) => {
-      sendResponse({ ok: true, status: 200, data: { type: 'cover', dataUrl: result.coverDataUrl || null } });
-    });
-    return true;
-  } else if (pathname === '/health') {
-    sendResponse({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '1.0.0' } });
-    return false;
-  } else {
-    sendResponse({ ok: false, status: 404, data: {} });
-    return false;
-  }
-
-  sendToHost(hostMessage)
-    .then((response) => {
-      if (response.type === 'status' && response.hasCover) {
-        return sendToHost({ type: 'getCover' }).then((cover) => {
-          if (cover.data) {
-            const dataUrl = `data:${cover.contentType};base64,${cover.data}`;
-            chrome.storage.session.set({ coverDataUrl: dataUrl });
-            response.coverUrl = 'cover:ready';
-          } else {
-            chrome.storage.session.set({ coverDataUrl: null });
-            response.coverUrl = null;
-          }
-          sendResponse({ ok: true, status: 200, data: response });
-        });
-      }
-      if (response.type === 'status' && !response.hasCover) {
-        chrome.storage.session.set({ coverDataUrl: null });
-      }
-      const ok = response.type !== 'error';
-      sendResponse({ ok, status: ok ? 200 : 503, data: response });
-    })
-    .catch((err) => {
-      sendResponse({ ok: false, status: 503, data: { error: err.message } });
-    });
+  }, 25000);
 
   return true;
+}
+
+function stopHost() {
+  if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
+  if (hostPort) {
+    try { hostPort.disconnect(); } catch (e) {}
+    hostPort = null;
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === 'startHost') {
+    // startHost is synchronous (connectNative returns immediately); call directly.
+    const ok = startHost();
+    sendResponse({ ok });
+    return false;
+  }
+  if (msg?.type === 'stopHost') {
+    stopHost();
+    sendResponse({ ok: true });
+    return false;
+  }
+  return false;
+});
+
+// On SW startup (e.g. after Chrome restart), if any xiaoxu.xin tab is already open,
+// re-establish the host. chrome.tabs.query is async → use sendResponse asynchronously.
+chrome.runtime.onStartup.addListener(() => {
+  chrome.tabs.query({ url: '*://xiaoxu.xin/*' }, (tabs) => {
+    if (tabs && tabs.length > 0) {
+      startHost();
+    }
+  });
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.tabs.query({ url: '*://xiaoxu.xin/*' }, (tabs) => {
+    if (tabs && tabs.length > 0) {
+      startHost();
+    }
+  });
 });

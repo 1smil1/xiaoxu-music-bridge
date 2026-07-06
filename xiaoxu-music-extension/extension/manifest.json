@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApngvd9pFIEebLx72mo1JysmrexOwGUnglYHM/AzDf9OON2kvLKrDrKzCclVWht+Fh40yLW8pmBvZ0yIP6gNljauEBPivrq18/YQ5aTTGsjGC5Uga/rhkBJlCWgNugzbcdVAN+UwEO0KBMAUcdwjT5B7Q5g0JF+u+rl5WAt8QdGs9CfOAmKqpVm/WNtuDzmhn4Kj/fVkx2ImC/9WjgHwrFWeMU6frRKF60zioGtm+Gtv9yi8qMDbnj/lw8waaMsHQi622oZ5rLSCpslBRF5M8q3n915znZbumWK/nt/1wytfEL8zjSeQwsZH0Q3nPxRneL7ISyCFx4kL9cP3F+Nlm/QIDAQAB",
   "name": "xiaoxu-music-bridge",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "桥接本地音乐播放器到 xiaoxu.xin 壁纸页面",
   "permissions": [
-    "nativeMessaging",
-    "storage"
+    "nativeMessaging"
   ],
   "host_permissions": [
     "*://xiaoxu.xin/*"
@@ -22,16 +22,6 @@
         "content.js"
       ],
       "run_at": "document_start"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "injected.js"
-      ],
-      "matches": [
-        "*://xiaoxu.xin/*"
-      ]
     }
   ],
   "icons": {

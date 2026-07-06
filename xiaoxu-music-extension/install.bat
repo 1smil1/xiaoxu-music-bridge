@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 chcp 65001 >nul 2>&1
 title xiaoxu-music-bridge 安装
 
@@ -16,7 +16,6 @@ echo.
 set "INSTALL_DIR=%~dp0"
 set "INSTALL_DIR=%INSTALL_DIR:~0,-1%"
 
-:: Check files
 if not exist "%INSTALL_DIR%\xiaoxu-music-host.exe" (
     echo  [ERROR] xiaoxu-music-host.exe not found
     echo.
@@ -46,44 +45,41 @@ if "%EXT_ID%"=="" (
     exit /b 1
 )
 
-echo  [1/4] Extension ID: %EXT_ID%
-echo  [1/4] Install path: %INSTALL_DIR%
+echo  [1/5] Extension ID: %EXT_ID%
+echo  [1/5] Install path: %INSTALL_DIR%
 echo.
 
-:: Step 1: Kill existing host process
-echo  [2/4] Killing existing host process...
+echo  [2/5] Killing existing host process...
 taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
-echo  [2/4] OK
+taskkill /F /IM xiaoxu-music-bridge.exe >nul 2>&1
+echo  [2/5] OK
 echo.
 
-:: Step 2: Generate host manifest (ConvertTo-Json handles backslash escaping)
-echo  [3/4] Generating xiaoxu_music_host.json ...
+echo  [3/5] Generating xiaoxu_music_host.json ...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$j = @{name='xiaoxu_music_host';description='xiaoxu-music-bridge native messaging host';path='%INSTALL_DIR%\xiaoxu-music-host.exe';type='stdio';allowed_origins=@('chrome-extension://%EXT_ID%/')} | ConvertTo-Json -Compress; [System.IO.File]::WriteAllText('%INSTALL_DIR%\xiaoxu_music_host.json', $j)" >nul 2>&1
 if %errorlevel% neq 0 (
-    echo  [3/4] FAILED - PowerShell error
+    echo  [3/5] FAILED - PowerShell error
     echo.
     pause
     exit /b 1
 )
 
 if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
-    echo  [3/4] FAILED - json file not created
+    echo  [3/5] FAILED - json file not created
     echo.
     pause
     exit /b 1
 )
-echo  [3/4] OK
+echo  [3/5] OK
 echo.
 
-:: Step 3: Write registry
-echo  [4/4] Writing registry ...
+echo  [4/5] Writing registry ...
 reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
 reg add "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
-echo  [4/4] OK (HKCU + HKLM)
+echo  [4/5] OK (HKCU + HKLM)
 echo.
 
-:: Step 4: Restart Chrome
-echo  Closing Chrome ...
+echo  [5/5] Closing Chrome ...
 taskkill /F /IM chrome.exe >nul 2>&1
 timeout /t 2 /nobreak >nul
 
@@ -98,6 +94,9 @@ echo  1. 打开 chrome://extensions
 echo  2. 开启开发者模式
 echo  3. 点击"加载已解压的扩展程序"选择:
 echo     %INSTALL_DIR%\extension
+echo.
+echo  扩展 ID 应为: %EXT_ID%
+echo  (manifest.json 已内置 key，ID 在所有电脑上都固定为此值)
 echo.
 
 if exist "C:\Program Files\Google\Chrome\Application\chrome.exe" (
