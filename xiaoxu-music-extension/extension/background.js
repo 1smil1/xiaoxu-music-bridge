@@ -153,8 +153,11 @@ setInterval(() => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Beat subscription management — content script connects a long-lived port
   if (message.type === 'BEAT_SUBSCRIBE') {
-    // Reuse existing port if same sender, else replace
-    beatPort = sender;
+    // The actual Port is registered by chrome.runtime.onConnect (see below).
+    // Do NOT overwrite beatPort with  here - sender is a Sender
+    // object (tab/frame metadata) which has no postMessage. We only kick
+    // off the host subscription; the forward path uses the Port stored in
+    // beatPort by the onConnect listener.
     console.log('[xiaoxu-music] BEAT_SUBSCRIBE from tab', sender.tab?.id);
     const ok = subscribeBeat();
     sendResponse({ ok });
@@ -302,7 +305,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Detect content script disconnect → unsubscribe beat
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'beat-port') {
-    beatPort = port.sender;
+    // Store the Port (not port.sender - Sender lacks postMessage)
+    beatPort = port;
     port.onDisconnect.addListener(() => {
       console.log('[xiaoxu-music] beat port disconnected');
       if (beatHost) {
