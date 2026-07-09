@@ -197,7 +197,10 @@ async function handleBridgeRequest(port, fetchId, message) {
     };
 
     let coverDataUrl = null;
-    if (statusResp.hasCover) {
+    // QQ Music's native GSMTC thumbnail is usually null (CEF doesn't expose it to
+    // Windows.Media), but our HandleGetCover Tier 2 will try the QQ Music search API
+    // when source=QQMusic. So call getCover for QQ Music regardless of hasCover.
+    if (statusResp.hasCover || statusResp.source === 'QQMusic') {
       try {
         const cover = await sendToHost({ type: 'getCover' });
         if (cover && cover.data) {
@@ -255,7 +258,7 @@ async function handleBridgeRequest(port, fetchId, message) {
 
   try {
     const response = await sendToHost(hostMessage);
-    if (response.type === 'status' && response.hasCover) {
+    if (response.type === 'status' && (response.hasCover || response.source === 'QQMusic')) {
       const cover = await sendToHost({ type: 'getCover' });
       if (cover.data) {
         const dataUrl = `data:${cover.contentType};base64,${cover.data}`;

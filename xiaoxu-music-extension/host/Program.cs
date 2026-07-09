@@ -243,6 +243,12 @@ static async Task<string> HandleGetStatus(
 
     static string SerializeStatus(MediaStatus status, bool viaFallback)
     {
+        // For QQ Music the native GSMTC thumbnail is usually null (CEF doesn't expose
+        // it to Windows.Media). Mark hasCover=true when source=QQMusic so the bridge
+        // will actually call getCover - Tier 2 of HandleGetCover then runs the QQ Music
+        // lookup as a fallback before returning null.
+        bool hasCover = status.CoverUrl is not null
+            || string.Equals(status.Source, "QQMusic", StringComparison.Ordinal);
         return JsonSerializer.Serialize(new
         {
             type = "status",
@@ -252,7 +258,7 @@ static async Task<string> HandleGetStatus(
             artist = status.Artist,
             album = status.Album,
             coverUrl = (string?)null,
-            hasCover = status.CoverUrl is not null,
+            hasCover,
             isPlaying = status.IsPlaying,
             positionMs = status.PositionMs,
             durationMs = status.DurationMs,
@@ -409,19 +415,52 @@ static async Task<string> HandleGetCover(
         if (!timedOut)
         {
             GsmtcHealthTracker.RecordSuccess();
-            if (cover is null)
+            if (cover is not null)
             {
-                // Tier 2: GSMTC alive but cover is null — non-QQ sources shouldn't fall through to QQ lookup
-                return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = false });
+                // Tier 1: native cover from GSMTC
+                return JsonSerializer.Serialize(new
+                {
+                    type = "cover",
+                    data = Convert.ToBase64String(cover.Bytes),
+                    contentType = cover.ContentType,
+                    viaFallback = false
+                });
             }
-            // Tier 1: native cover from GSMTC
-            return JsonSerializer.Serialize(new
+            // Tier 2: GSMTC alive but no native cover. For QQ Music we can still try
+            // the public QQ Music search API to find an album thumb. For other sources
+            // we have no fallback path - return null.
+            var (gsmtcStatus, statusTimedOut) = await WithTimeout(
+                gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forCover)");
+            if (!statusTimedOut && string.Equals(gsmtcStatus.Source, "QQMusic", StringComparison.Ordinal)
+                && !string.IsNullOrWhiteSpace(gsmtcStatus.Title))
             {
-                type = "cover",
-                data = Convert.ToBase64String(cover.Bytes),
-                contentType = cover.ContentType,
-                viaFallback = false
-            });
+                                var (tier2Cover, tier2TimedOut) = await WithTimeout(
+                    coverLookup.GetCoverAsync(gsmtcStatus.Title, gsmtcStatus.Artist, CancellationToken.None),
+                    5000, "QqMusicCoverLookup(tier2)");
+                if (tier2TimedOut)
+                {
+                    LogPaths.SafeAppend(LogPaths.DebugLog,
+                        $"[{DateTime.Now:HH:mm:ss}] HandleGetCover Tier2 QQ lookup TIMEOUT for title={gsmtcStatus.Title}\n");
+                }
+                else if (tier2Cover is not null)
+                {
+                    LogPaths.SafeAppend(LogPaths.DebugLog,
+                        $"[{DateTime.Now:HH:mm:ss}] HandleGetCover Tier2 QQ lookup OK bytes={tier2Cover.Bytes.Length} for title={gsmtcStatus.Title}\n");
+                    return JsonSerializer.Serialize(new
+                    {
+                        type = "cover",
+                        data = Convert.ToBase64String(tier2Cover.Bytes),
+                        contentType = tier2Cover.ContentType,
+                        viaFallback = false
+                    });
+                }
+                else
+                {
+                    LogPaths.SafeAppend(LogPaths.DebugLog,
+                        $"[{DateTime.Now:HH:mm:ss}] HandleGetCover Tier2 QQ lookup null for title={gsmtcStatus.Title}\n");
+                }
+            }
+            return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = false });
         }
         GsmtcHealthTracker.RecordFailure("GetCurrentCoverAsync");
         GsmtcCircuitBreaker.Open();
