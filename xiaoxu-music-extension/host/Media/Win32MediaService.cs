@@ -10,11 +10,13 @@
 //   Title         ✅  from window title (before " - ")
 //   Artist        ✅  from window title (after " - ")
 //   Source        ✅  "QQMusic" derived from process name
-//   isPlaying     ⚠️  heuristic: title is non-empty (== track loaded)
+//   isPlaying     ❌  no reliable source — left false (honest "I don't know");
+//                   frontend uses AudioBeatService RMS as proxy (see WallpaperDashboard.tsx)
 //   Album/Album   ❌  not in title — left null
 //   Position      ❌  no reliable source — left 0
 //   Duration      ❌  no reliable source — left 0
-//   Cover         ❌  CEF renders offscreen; PrintWindow path is brittle — left null
+//   Cover         ❌  CEF renders offscreen; PrintWindow path is brittle — covered
+//                   via QqMusicCoverLookupService (third tier)
 //
 // GSMTC remains the primary path; this is only used after a GSMTC timeout.
 
@@ -47,7 +49,7 @@ public sealed class Win32MediaService : IMediaSessionService
             Artist: artist,
             Album: null,
             CoverUrl: null,
-            IsPlaying: hasTrack,
+            IsPlaying: false, // Win32 fallback cannot distinguish play/pause
             PositionMs: 0,
             DurationMs: 0,
             UpdatedAt: DateTimeOffset.Now));

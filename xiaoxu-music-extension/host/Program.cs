@@ -31,7 +31,10 @@ var lyricsDir = args.FirstOrDefault(a => !a.StartsWith("chrome-extension://") &&
 var gsmtcService = new WindowsMediaSessionService();
 var win32Fallback = new Win32MediaService();
 DateTime gsmtcSkipUntil = DateTime.MinValue; // circuit breaker
-var lyricService = new LocalLyricService(lyricsDir, new HttpClient());
+// Shared HttpClient for lyric + cover lookup services (avoids socket-pool fragmentation)
+var sharedHttp = new HttpClient();
+var coverLookup = new QqMusicCoverLookupService(sharedHttp);
+var lyricService = new LocalLyricService(lyricsDir, sharedHttp);
 
 // Audio beat service - captures system audio and computes bass/volume/pulse
 // Started on first subscribeBeat command, stopped on unsubscribeBeat
@@ -109,7 +112,7 @@ while (true)
             "getStatus" => await HandleGetStatus(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip),
             "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, doc.RootElement),
             "getLyrics" => await HandleGetLyrics(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
-            "getCover" => await HandleGetCover(gsmtcService, GsmtcCircuitBreaker.ShouldSkip),
+            "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, GsmtcCircuitBreaker.ShouldSkip),
             "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, stdout, stdoutLock),
             "unsubscribeBeat" => HandleUnsubscribeBeat(ref beatService),
             "getBeat" => HandleGetBeat(beatService),
@@ -389,34 +392,79 @@ static async Task<string> HandleGetLyrics(
     });
 }
 
-static async Task<string> HandleGetCover(WindowsMediaSessionService gsmtc, Func<bool> shouldSkipGsmtc)
+static async Task<string> HandleGetCover(
+    WindowsMediaSessionService gsmtc,
+    Win32MediaService fallback,
+    QqMusicCoverLookupService coverLookup,
+    Func<bool> shouldSkipGsmtc)
 {
-    // GSMTC is the only path that can return a cover bitmap. Fallback returns null.
-    // When GSMTC is hung we skip it entirely — no benefit in waiting 1.5s for null.
-    if (shouldSkipGsmtc())
+    // TIER 1: GSMTC normal + has cover → return base64 directly
+    // TIER 2: GSMTC normal but cover is null → return null (don't try QQ lookup for non-QQ sources)
+    // TIER 3: GSMTC skipped / timed out → Win32 fallback for title/artist → QQ Music cover lookup
+
+    if (!shouldSkipGsmtc())
     {
-        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
-    }
-    var (cover, timedOut) = await WithTimeout(
-        gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GetCurrentCoverAsync");
-    if (timedOut)
-    {
+        var (cover, timedOut) = await WithTimeout(
+            gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GetCurrentCoverAsync");
+        if (!timedOut)
+        {
+            GsmtcHealthTracker.RecordSuccess();
+            if (cover is null)
+            {
+                // Tier 2: GSMTC alive but cover is null — non-QQ sources shouldn't fall through to QQ lookup
+                return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = false });
+            }
+            // Tier 1: native cover from GSMTC
+            return JsonSerializer.Serialize(new
+            {
+                type = "cover",
+                data = Convert.ToBase64String(cover.Bytes),
+                contentType = cover.ContentType,
+                viaFallback = false
+            });
+        }
         GsmtcHealthTracker.RecordFailure("GetCurrentCoverAsync");
         GsmtcCircuitBreaker.Open();
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT — returning null cover\n");
-        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT → Win32 fallback + QQ cover lookup\n");
     }
-    if (cover is null)
+    else
     {
-        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null });
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC skipped (circuit breaker open) → Win32 fallback + QQ cover lookup\n");
     }
 
+    // Tier 3: GSMTC unavailable — read title/artist from Win32 daemon title, then query QQ Music
+    var fbStatus = await fallback.GetStatusAsync(CancellationToken.None);
+    if (string.IsNullOrWhiteSpace(fbStatus.Title))
+    {
+        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
+    }
+
+    var (qqCover, qqTimedOut) = await WithTimeout(
+        coverLookup.GetCoverAsync(fbStatus.Title, fbStatus.Artist, CancellationToken.None),
+        5000, "QqMusicCoverLookup");
+    if (qqTimedOut)
+    {
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover QQ lookup TIMEOUT for title={fbStatus.Title}\n");
+        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
+    }
+    if (qqCover is null)
+    {
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover QQ lookup null for title={fbStatus.Title}\n");
+        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
+    }
+
+    LogPaths.SafeAppend(LogPaths.DebugLog,
+        $"[{DateTime.Now:HH:mm:ss}] HandleGetCover QQ lookup OK bytes={qqCover.Bytes.Length} for title={fbStatus.Title}\n");
     return JsonSerializer.Serialize(new
     {
         type = "cover",
-        data = Convert.ToBase64String(cover.Bytes),
-        contentType = cover.ContentType
+        data = Convert.ToBase64String(qqCover.Bytes),
+        contentType = qqCover.ContentType,
+        viaFallback = true
     });
 }
 
