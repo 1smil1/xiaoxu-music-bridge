@@ -36,13 +36,32 @@ function postBridgeError(fetchId, message) {
 let port = null;
 let reconnectTimer = null;
 let reqId = 0;
+let extensionContextInvalidated = false;
 const pending = new Map(); // _bridgeFetchId → { resolve, reject }
 
+function isContextInvalidated(err) {
+  if (!err) return false;
+  const msg = (err.message || String(err) || '').toLowerCase();
+  // Only treat EXPLICIT "extension context invalidated" as fatal.
+  // "Message port closed" happens whenever the SW is terminated by Chrome
+  // (idle timeout, low-memory eviction, browser shutdown) — it is NOT a
+  // context invalidation, the extension is still usable, just reconnect.
+  // Treating it as fatal here would lock `extensionContextInvalidated=true`
+  // forever, and every subsequent BRIDGE_FETCH would 503.
+  return msg.includes('extension context invalidated');
+}
+
 function openPort() {
-  if (port) return;
+  if (port || extensionContextInvalidated) return;
   try {
     port = chrome.runtime.connect({ name: 'xiaoxu-bridge' });
   } catch (e) {
+    if (isContextInvalidated(e)) {
+      console.warn('[xiaoxu-music] extension context invalidated — please reload the page (Ctrl+Shift+R) to recover');
+      extensionContextInvalidated = true;
+      window.postMessage({ type: 'BRIDGE_RELOAD_REQUIRED' }, '*');
+      return;
+    }
     console.warn('[xiaoxu-music] connect failed:', e.message);
     scheduleReconnect();
     return;
@@ -86,6 +105,12 @@ function openPort() {
     const err = chrome.runtime.lastError;
     console.warn('[xiaoxu-music] bridge port disconnected, lastError:', err?.message);
     port = null;
+    if (isContextInvalidated(err)) {
+      console.warn('[xiaoxu-music] extension context invalidated — please reload the page (Ctrl+Shift+R) to recover');
+      extensionContextInvalidated = true;
+      window.postMessage({ type: 'BRIDGE_RELOAD_REQUIRED' }, '*');
+      return;
+    }
     // Reject all pending fetches so the page's await Promise resolves with 503
     for (const [, cb] of pending) {
       cb({ error: err?.message || 'Bridge port disconnected', status: 503 });
@@ -96,11 +121,13 @@ function openPort() {
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer) return;
+  if (reconnectTimer || extensionContextInvalidated) return;
+  // Reconnect fast — every poll waits at most 100ms before the port comes back.
+  // Old 1000ms left a window where 4 in-flight /state/current requests all 503'd.
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     openPort();
-  }, 1000);
+  }, 100);
 }
 
 // Open immediately so the service worker is kept alive as soon as the page loads
@@ -115,7 +142,11 @@ window.addEventListener('message', (e) => {
 
   if (data.type === 'BRIDGE_FETCH') {
     if (!port) {
-      postBridgeError(data._bridgeFetchId, 'Bridge port not connected');
+      const msg = extensionContextInvalidated
+        ? 'Extension was reloaded. Please reload this page (Ctrl+Shift+R).'
+        : 'Bridge port not connected';
+      console.warn('[xiaoxu-music] BRIDGE_FETCH failed (no port):', data.url, '—', msg);
+      postBridgeError(data._bridgeFetchId, msg);
       return;
     }
     const id = ++reqId;
@@ -128,6 +159,7 @@ window.addEventListener('message', (e) => {
       });
       pending.set(id, (response) => {
         if (response && response.error) {
+          console.warn('[xiaoxu-music] BRIDGE_FETCH host error:', data.url, '—', response.error);
           postBridgeError(data._bridgeFetchId, response.error);
         } else {
           window.postMessage({
@@ -140,6 +172,7 @@ window.addEventListener('message', (e) => {
         }
       });
     } catch (e) {
+      console.warn('[xiaoxu-music] BRIDGE_FETCH postMessage threw:', data.url, '—', e.message);
       pending.delete(id);
       postBridgeError(data._bridgeFetchId, e.message);
     }
