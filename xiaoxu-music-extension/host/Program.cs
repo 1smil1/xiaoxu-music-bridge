@@ -113,7 +113,7 @@ while (true)
             "getStatus" => await HandleGetStatus(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip),
             "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, doc.RootElement),
             "getLyrics" => await HandleGetLyrics(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
-            "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, itunesCoverLookup, GsmtcCircuitBreaker.ShouldSkip),
+            "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, itunesCoverLookup, GsmtcCircuitBreaker.ShouldSkipCover),
             "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, stdout, stdoutLock),
             "unsubscribeBeat" => HandleUnsubscribeBeat(ref beatService),
             "getBeat" => HandleGetBeat(beatService),
@@ -216,13 +216,15 @@ static async Task<string> HandleGetStatus(
     // Try GSMTC first unless the circuit breaker says it's been failing
     if (!shouldSkipGsmtc())
     {
+        var statusStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var (status, timedOut) = await WithTimeout(
             gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync");
+        statusStopwatch.Stop();
         if (!timedOut)
         {
             GsmtcHealthTracker.RecordSuccess();
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] Status (GSMTC): title={status.Title}, artist={status.Artist}, hasCover={status.CoverUrl is not null}\n");
+                $"[{DateTime.Now:HH:mm:ss}] Status (GSMTC): title={status.Title}, artist={status.Artist}, pos={status.PositionMs}, dur={status.DurationMs}, dt={statusStopwatch.ElapsedMilliseconds}ms\n");
             return SerializeStatus(status, viaFallback: false);
         }
         // Timed out — log failure and open the circuit breaker for 30s
@@ -404,7 +406,7 @@ static async Task<string> HandleGetCover(
     Win32MediaService fallback,
     QqMusicCoverLookupService coverLookup,
     ITunesCoverLookupService itunesLookup,
-    Func<bool> shouldSkipGsmtc)
+    Func<bool> shouldSkipGsmtcCover)
 {
     // TIER 1  : GSMTC alive + native cover        → return base64 directly
     // TIER 2  : GSMTC alive, cover=null, QQ-ish    → QQ lookup → iTunes lookup
@@ -482,7 +484,7 @@ static async Task<string> HandleGetCover(
 
     // --- GSMTC path (Tier 1 / 2 / 2b) ---------------------------------------
 
-    if (!shouldSkipGsmtc())
+    if (!shouldSkipGsmtcCover())
     {
         var (cover, timedOut) = await WithTimeout(
             gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GetCurrentCoverAsync");
@@ -537,7 +539,7 @@ static async Task<string> HandleGetCover(
             return NoCover(viaFallback: false);
         }
         GsmtcHealthTracker.RecordFailure("GetCurrentCoverAsync");
-        GsmtcCircuitBreaker.Open();
+        GsmtcCircuitBreaker.OpenCover();
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT → Win32 fallback + QQ/iTunes cover lookup\n");
     }

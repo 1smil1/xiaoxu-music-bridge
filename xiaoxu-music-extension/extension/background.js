@@ -168,7 +168,7 @@ async function handleBridgeRequest(port, fetchId, message) {
   }
 
   if (pathname === '/health') {
-    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.2.0' } });
+    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.2.2' } });
     return;
   }
 
@@ -187,6 +187,7 @@ async function handleBridgeRequest(port, fetchId, message) {
     const statusObj = {
       connected: !!statusResp.connected,
       source: statusResp.source ?? null,
+      viaFallback: statusResp.viaFallback ?? false,
       title: statusResp.title ?? null,
       artist: statusResp.artist ?? null,
       album: statusResp.album ?? null,
