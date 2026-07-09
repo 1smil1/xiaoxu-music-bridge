@@ -34,12 +34,25 @@ function connectHost() {
 
   host.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError;
-    console.error('[xiaoxu-music] native host DISCONNECTED, lastError:', err?.message,
+    console.warn('[xiaoxu-music] native host DISCONNECTED, lastError:', err?.message,
       'extension ID:', chrome.runtime.id);
+    const wasBeatActive = beatPort !== null;
     host = null;
     for (const [id, { reject }] of pending) {
       pending.delete(id);
       reject(new Error(err?.message || 'Native host disconnected'));
+    }
+    // If a content script was subscribed to beats, the new host spawned on the
+    // next sendToHost() call needs the subscribeBeat command re-sent, otherwise
+    // AudioBeatService is never started on the new host and /health stays at
+    // service_started: false. Defer to next tick so the disconnect handler
+    // returns first; the subscription is idempotent on the host side.
+    if (wasBeatActive) {
+      setTimeout(() => {
+        try { subscribeBeat(); } catch (e) {
+          console.warn('[xiaoxu-music] post-disconnect resubscribe failed:', e.message);
+        }
+      }, 0);
     }
   });
 
