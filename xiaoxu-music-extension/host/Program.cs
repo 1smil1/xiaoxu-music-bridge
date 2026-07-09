@@ -24,7 +24,13 @@ LogPaths.SafeAppend(LogPaths.DebugLog,
 // Chrome Native Messaging passes the extension origin as args[0] (e.g. "chrome-extension://...")
 // Skip it — only use args that look like valid local paths
 var lyricsDir = args.FirstOrDefault(a => !a.StartsWith("chrome-extension://") && Path.IsPathRooted(a));
-var mediaService = new WindowsMediaSessionService();
+// Primary: GSMTC (full metadata: album, cover, position, duration).
+// Fallback: Win32 GetWindowText on QQMusic_Daemon_Wnd (title + artist only).
+// When GSMTC's broker deadlocks, the fallback keeps the dashboard usable with
+// partial info instead of returning connected=false.
+var gsmtcService = new WindowsMediaSessionService();
+var win32Fallback = new Win32MediaService();
+DateTime gsmtcSkipUntil = DateTime.MinValue; // circuit breaker
 var lyricService = new LocalLyricService(lyricsDir, new HttpClient());
 
 // Audio beat service - captures system audio and computes bass/volume/pulse
@@ -100,10 +106,10 @@ while (true)
 
         responseJson = type switch
         {
-            "getStatus" => await HandleGetStatus(mediaService),
-            "control" => await HandleControl(mediaService, doc.RootElement),
-            "getLyrics" => await HandleGetLyrics(mediaService, lyricService),
-            "getCover" => await HandleGetCover(mediaService),
+            "getStatus" => await HandleGetStatus(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip),
+            "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, doc.RootElement),
+            "getLyrics" => await HandleGetLyrics(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
+            "getCover" => await HandleGetCover(gsmtcService, GsmtcCircuitBreaker.ShouldSkip),
             "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, stdout, stdoutLock),
             "unsubscribeBeat" => HandleUnsubscribeBeat(ref beatService),
             "getBeat" => HandleGetBeat(beatService),
@@ -198,55 +204,71 @@ static async Task<(T Result, bool TimedOut)> WithTimeout<T>(Task<T> task, int ti
     return (await task, false);
 }
 
-static async Task<string> HandleGetStatus(IMediaSessionService mediaService)
+static async Task<string> HandleGetStatus(
+    WindowsMediaSessionService gsmtc,
+    Win32MediaService fallback,
+    Func<bool> shouldSkipGsmtc)
 {
-    var (status, timedOut) = await WithTimeout(
-        mediaService.GetStatusAsync(CancellationToken.None), 5000, "GetStatusAsync");
-    if (timedOut)
+    // Try GSMTC first unless the circuit breaker says it's been failing
+    if (!shouldSkipGsmtc())
     {
+        var (status, timedOut) = await WithTimeout(
+            gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync");
+        if (!timedOut)
+        {
+            GsmtcHealthTracker.RecordSuccess();
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] Status (GSMTC): title={status.Title}, artist={status.Artist}, hasCover={status.CoverUrl is not null}\n");
+            return SerializeStatus(status, viaFallback: false);
+        }
+        // Timed out — log failure and open the circuit breaker for 30s
         GsmtcHealthTracker.RecordFailure("GetStatusAsync");
+        GsmtcCircuitBreaker.Open();
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus TIMEOUT — returning empty status (GSMTC likely hung)\n");
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC TIMEOUT → falling back to Win32 daemon title\n");
+    }
+    else
+    {
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC skipped (circuit breaker open) → Win32 fallback\n");
+    }
+
+    var fbStatus = await fallback.GetStatusAsync(CancellationToken.None);
+    LogPaths.SafeAppend(LogPaths.DebugLog,
+        $"[{DateTime.Now:HH:mm:ss}] Status (Win32 fallback): title={fbStatus.Title}, artist={fbStatus.Artist}\n");
+    return SerializeStatus(fbStatus, viaFallback: true);
+
+    static string SerializeStatus(MediaStatus status, bool viaFallback)
+    {
         return JsonSerializer.Serialize(new
         {
             type = "status",
-            connected = false,
-            source = (string?)null,
-            title = (string?)null,
-            artist = (string?)null,
-            album = (string?)null,
+            connected = status.Connected,
+            source = status.Source,
+            title = status.Title,
+            artist = status.Artist,
+            album = status.Album,
             coverUrl = (string?)null,
-            hasCover = false,
-            isPlaying = false,
-            positionMs = 0,
-            durationMs = 0,
-            updatedAt = (string?)null
+            hasCover = status.CoverUrl is not null,
+            isPlaying = status.IsPlaying,
+            positionMs = status.PositionMs,
+            durationMs = status.DurationMs,
+            updatedAt = status.UpdatedAt.ToString("o"),
+            viaFallback
         });
     }
-
-    LogPaths.SafeAppend(LogPaths.DebugLog,
-        $"[{DateTime.Now:HH:mm:ss}] Status: title={status.Title}, artist={status.Artist}, hasCover={status.CoverUrl is not null}\n");
-
-    GsmtcHealthTracker.RecordSuccess();
-
-    return JsonSerializer.Serialize(new
-    {
-        type = "status",
-        connected = status.Connected,
-        source = status.Source,
-        title = status.Title,
-        artist = status.Artist,
-        album = status.Album,
-        coverUrl = (string?)null,        // cover fetched separately via getCover
-        hasCover = status.CoverUrl is not null,
-        isPlaying = status.IsPlaying,
-        positionMs = status.PositionMs,
-        durationMs = status.DurationMs,
-        updatedAt = status.UpdatedAt.ToString("o")
-    });
 }
 
-static async Task<string> HandleControl(IMediaSessionService mediaService, JsonElement request)
+// Global circuit breaker state — closes the GSMTC path for 30s after a timeout
+// so we don't pay the 1.5s penalty on every getStatus when GSMTC is hung.
+// (Implementation lives in Common/GsmtcCircuitBreaker.cs — top-level types must
+// come AFTER all top-level statements, so we keep it out of this try block.)
+
+static async Task<string> HandleControl(
+    WindowsMediaSessionService gsmtc,
+    Win32MediaService fallback,
+    Func<bool> shouldSkipGsmtc,
+    JsonElement request)
 {
     var commandStr = request.GetProperty("command").GetString() ?? "";
     var command = commandStr switch
@@ -257,46 +279,82 @@ static async Task<string> HandleControl(IMediaSessionService mediaService, JsonE
         _ => throw new ArgumentException($"Unknown command: {commandStr}")
     };
 
-    var (result, timedOut) = await WithTimeout(
-        mediaService.SendCommandAsync(command, CancellationToken.None), 5000, "SendCommandAsync");
-    if (timedOut)
+    if (!shouldSkipGsmtc())
+    {
+        var (result, timedOut) = await WithTimeout(
+            gsmtc.SendCommandAsync(command, CancellationToken.None), 1500, "SendCommandAsync");
+        if (!timedOut)
+        {
+            GsmtcHealthTracker.RecordSuccess();
+            return JsonSerializer.Serialize(new
+            {
+                type = "controlResult",
+                ok = result.Ok,
+                error = result.Error,
+                viaFallback = false
+            });
+        }
+        GsmtcHealthTracker.RecordFailure("SendCommandAsync");
+        GsmtcCircuitBreaker.Open();
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] HandleControl GSMTC TIMEOUT control={commandStr} → media keys\n");
+    }
+    else
     {
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleControl TIMEOUT — control={commandStr}\n");
-        return JsonSerializer.Serialize(new { type = "controlResult", ok = false, error = "control timeout (GSMTC hung)" });
+            $"[{DateTime.Now:HH:mm:ss}] HandleControl GSMTC skipped (circuit breaker open) → media keys\n");
     }
+
+    // Fallback: send media keys system-wide. Works for QQ Music and any media player.
+    var fbResult = await fallback.SendCommandAsync(command, CancellationToken.None);
     return JsonSerializer.Serialize(new
     {
         type = "controlResult",
-        ok = result.Ok,
-        error = result.Error
+        ok = fbResult.Ok,
+        error = fbResult.Error,
+        viaFallback = true
     });
 }
 
-static async Task<string> HandleGetLyrics(IMediaSessionService mediaService, LocalLyricService lyricService)
+static async Task<string> HandleGetLyrics(
+    WindowsMediaSessionService gsmtc,
+    Win32MediaService fallback,
+    LocalLyricService lyricService,
+    Func<bool> shouldSkipGsmtc)
 {
-    var (status, statusTimedOut) = await WithTimeout(
-        mediaService.GetStatusAsync(CancellationToken.None), 5000, "GetStatusAsync(forLyrics)");
-    if (statusTimedOut)
+    MediaStatus status;
+    bool viaFallback = false;
+
+    if (!shouldSkipGsmtc())
     {
-        GsmtcHealthTracker.RecordFailure("GetStatusAsync(forLyrics)");
-        LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics TIMEOUT on status — returning no-lyrics\n");
-        return JsonSerializer.Serialize(new
+        var (s, statusTimedOut) = await WithTimeout(
+            gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forLyrics)");
+        if (!statusTimedOut)
         {
-            type = "lyrics",
-            found = false,
-            title = (string?)null,
-            artist = (string?)null,
-            fileName = (string?)null,
-            lrc = (string?)null,
-            source = (string?)null,
-            synced = false
-        });
+            status = s;
+            GsmtcHealthTracker.RecordSuccess();
+        }
+        else
+        {
+            GsmtcHealthTracker.RecordFailure("GetStatusAsync(forLyrics)");
+            GsmtcCircuitBreaker.Open();
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics GSMTC TIMEOUT → Win32 fallback\n");
+            status = await fallback.GetStatusAsync(CancellationToken.None);
+            viaFallback = true;
+        }
     }
+    else
+    {
+        status = await fallback.GetStatusAsync(CancellationToken.None);
+        viaFallback = true;
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics GSMTC skipped (circuit breaker open) → Win32 fallback\n");
+    }
+
     LogPaths.SafeAppend(LogPaths.DebugLog,
-        $"[{DateTime.Now:HH:mm:ss}] Lyrics: title={status.Title}, artist={status.Artist}\n");
-    GsmtcHealthTracker.RecordSuccess();
+        $"[{DateTime.Now:HH:mm:ss}] Lyrics: title={status.Title}, artist={status.Artist}, viaFallback={viaFallback}\n");
+
     var (lyrics, lyricsTimedOut) = await WithTimeout(
         lyricService.GetCurrentLyricsAsync(status, CancellationToken.None), 5000, "GetCurrentLyricsAsync");
     if (lyricsTimedOut)
@@ -326,19 +384,28 @@ static async Task<string> HandleGetLyrics(IMediaSessionService mediaService, Loc
         fileName = lyrics.FileName,
         lrc = lyrics.Lrc,
         source = lyrics.Source,
-        synced = lyrics.Synced
+        synced = lyrics.Synced,
+        viaFallback
     });
 }
 
-static async Task<string> HandleGetCover(IMediaSessionService mediaService)
+static async Task<string> HandleGetCover(WindowsMediaSessionService gsmtc, Func<bool> shouldSkipGsmtc)
 {
+    // GSMTC is the only path that can return a cover bitmap. Fallback returns null.
+    // When GSMTC is hung we skip it entirely — no benefit in waiting 1.5s for null.
+    if (shouldSkipGsmtc())
+    {
+        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
+    }
     var (cover, timedOut) = await WithTimeout(
-        mediaService.GetCurrentCoverAsync(CancellationToken.None), 5000, "GetCurrentCoverAsync");
+        gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GetCurrentCoverAsync");
     if (timedOut)
     {
+        GsmtcHealthTracker.RecordFailure("GetCurrentCoverAsync");
+        GsmtcCircuitBreaker.Open();
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover TIMEOUT — returning null cover\n");
-        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null });
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT — returning null cover\n");
+        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
     }
     if (cover is null)
     {
