@@ -1,13 +1,16 @@
 // background.js — Chrome extension service worker
 // Connects to native messaging host and relays messages between content script and host.
 //
-// Two host channels:
-//   1. Request/response (getStatus, control, getLyrics, getCover) — long-lived port
+// Single host connection multiplexes:
+//   1. Request/response (getStatus, control, getLyrics, getCover)
 //   2. Beat stream (subscribeBeat) — host pushes unsolicited beat messages
+//
+// One chrome.runtime.connectNative = one host.exe process. The previous design
+// opened TWO connectNative calls (one for cmd/resp, one for beats), causing
+// two host processes to race on port 17889 and split state. Merged into one.
 
 const HOST_NAME = 'xiaoxu_music_host';
-let host = null;          // request/response port (long-lived)
-let beatHost = null;      // beat stream port (separate, allows async push)
+let host = null;          // single long-lived native messaging port
 let requestId = 0;
 const pending = new Map();
 
@@ -31,7 +34,7 @@ function connectHost() {
 
   host.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError;
-    console.error('[xiaoxu-music] native host DISCONNECTED immediately, lastError:', err?.message,
+    console.error('[xiaoxu-music] native host DISCONNECTED, lastError:', err?.message,
       'extension ID:', chrome.runtime.id);
     host = null;
     for (const [id, { reject }] of pending) {
@@ -41,11 +44,36 @@ function connectHost() {
   });
 
   host.onMessage.addListener((message) => {
+    // Route response messages to pending requests first.
     const id = message._id;
     if (id !== undefined && pending.has(id)) {
       const { resolve, reject } = pending.get(id);
       pending.delete(id);
       resolve(message);
+      return;
+    }
+
+    // Unsolicited beat push (no _id) — forward to content-script beat port.
+    if (message.type === 'beat' && beatPort) {
+      try {
+        const forward = {
+          type: 'BEAT_UPDATE',
+          bass: message.bass ?? 0,
+          volume: message.volume ?? 0,
+          pulse: message.pulse ?? 0,
+          glow: message.glow ?? 0,
+        };
+        if (message.bands) forward.bands = message.bands;
+        if (message.features) forward.features = message.features;
+        if (message.onsets) forward.onsets = message.onsets;
+        if (message.rhythm) forward.rhythm = message.rhythm;
+        if (message.state) forward.state = message.state;
+        if (typeof message.ts === 'number') forward.ts = message.ts;
+        beatPort.postMessage(forward);
+      } catch (e) {
+        console.warn('[xiaoxu-music] beat port post failed:', e.message);
+        beatPort = null;
+      }
     }
   });
 
@@ -74,76 +102,32 @@ function sendToHost(message) {
   });
 }
 
-// ---- Beat stream management ----
-
-function connectBeatHost() {
-  if (beatHost) return beatHost;
-
-  try {
-    beatHost = chrome.runtime.connectNative(HOST_NAME);
-    console.log('[xiaoxu-music] beat host connectNative SUCCESS');
-  } catch (e) {
-    const err = chrome.runtime.lastError;
-    console.error('[xiaoxu-music] beat host connectNative FAILED:', err?.message);
-    beatHost = null;
-    return null;
-  }
-
-  beatHost.onDisconnect.addListener(() => {
-    const err = chrome.runtime.lastError;
-    console.warn('[xiaoxu-music] beat host disconnected:', err?.message);
-    beatHost = null;
-    // Will reconnect on next subscribeBeat
-  });
-
-  beatHost.onMessage.addListener((message) => {
-    // Route unsolicited beat messages to content script.
-    // Forward the full v3 payload (bands/features/onsets/rhythm/state) when present;
-    // fall back to legacy bass/volume/pulse/glow fields otherwise.
-    if (message.type === 'beat' && beatPort) {
-      try {
-        const forward = {
-          type: 'BEAT_UPDATE',
-          bass: message.bass ?? 0,
-          volume: message.volume ?? 0,
-          pulse: message.pulse ?? 0,
-          glow: message.glow ?? 0,
-        };
-        if (message.bands) forward.bands = message.bands;
-        if (message.features) forward.features = message.features;
-        if (message.onsets) forward.onsets = message.onsets;
-        if (message.rhythm) forward.rhythm = message.rhythm;
-        if (message.state) forward.state = message.state;
-        if (typeof message.ts === 'number') forward.ts = message.ts;
-        beatPort.postMessage(forward);
-      } catch (e) {
-        console.warn('[xiaoxu-music] beat port post failed:', e.message);
-        beatPort = null;
-      }
-    }
-  });
-
-  return beatHost;
-}
+// ---- Beat stream management (shares the single host connection) ----
 
 function subscribeBeat() {
-  const h = connectBeatHost();
+  const h = connectHost();
   if (!h) return false;
 
-  h.postMessage({ type: 'subscribeBeat' });
+  try {
+    h.postMessage({ type: 'subscribeBeat' });
+  } catch (e) {
+    console.warn('[xiaoxu-music] subscribeBeat postMessage failed:', e.message);
+    host = null;
+    return false;
+  }
   beatLastSubscribe = Date.now();
   return true;
 }
 
 // Periodic resubscribe to keep host alive (host auto-unsubscribes after 30s of no refresh)
 setInterval(() => {
-  if (beatPort && beatHost && Date.now() - beatLastSubscribe > BEAT_RESUBSCRIBE_INTERVAL) {
+  if (beatPort && host && Date.now() - beatLastSubscribe > BEAT_RESUBSCRIBE_INTERVAL) {
     try {
-      beatHost.postMessage({ type: 'subscribeBeat' });
+      host.postMessage({ type: 'subscribeBeat' });
       beatLastSubscribe = Date.now();
     } catch (e) {
       console.warn('[xiaoxu-music] beat resubscribe failed:', e.message);
-      beatHost = null;
+      host = null;
     }
   }
 }, 5000);
@@ -154,7 +138,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Beat subscription management — content script connects a long-lived port
   if (message.type === 'BEAT_SUBSCRIBE') {
     // The actual Port is registered by chrome.runtime.onConnect (see below).
-    // Do NOT overwrite beatPort with  here - sender is a Sender
+    // Do NOT overwrite beatPort with sender here — sender is a Sender
     // object (tab/frame metadata) which has no postMessage. We only kick
     // off the host subscription; the forward path uses the Port stored in
     // beatPort by the onConnect listener.
@@ -166,8 +150,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'BEAT_UNSUBSCRIBE') {
     console.log('[xiaoxu-music] BEAT_UNSUBSCRIBE');
-    if (beatHost) {
-      try { beatHost.postMessage({ type: 'unsubscribeBeat' }); } catch (e) {}
+    if (host) {
+      try { host.postMessage({ type: 'unsubscribeBeat' }); } catch (e) {}
     }
     beatPort = null;
     return false;
@@ -302,15 +286,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-// Detect content script disconnect → unsubscribe beat
+// Detect content script disconnect — unsubscribe beat
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'beat-port') {
     // Store the Port (not port.sender - Sender lacks postMessage)
     beatPort = port;
     port.onDisconnect.addListener(() => {
       console.log('[xiaoxu-music] beat port disconnected');
-      if (beatHost) {
-        try { beatHost.postMessage({ type: 'unsubscribeBeat' }); } catch (e) {}
+      if (host) {
+        try { host.postMessage({ type: 'unsubscribeBeat' }); } catch (e) {}
       }
       beatPort = null;
     });
