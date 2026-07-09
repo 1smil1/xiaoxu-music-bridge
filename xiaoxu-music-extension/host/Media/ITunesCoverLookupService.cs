@@ -1,22 +1,29 @@
-// QqMusicCoverLookupService — third-tier cover lookup for the Win32 fallback path.
+// ITunesCoverLookupService — final-tier cover lookup fallback (Tier 4).
 //
-// Why: GSMTC's `GetCurrentCoverAsync` is the only path that returns a real album-art
-//      bitmap. When GSMTC's broker deadlocks (frequent on Windows 11), we skip GSMTC
-//      and the Win32MediaService has no native cover source. This service queries
-//      QQ Music's public search API for `albummid`, then downloads a JPG from the
-//      public `y.gtimg.cn` CDN and returns it as a base64 CoverImage.
+// Why: QQ Music's public search + CDN is the primary cover source, but it misses
+//      for some tracks (CDN 404, search miss, non-QQ sources). The Apple iTunes
+//      Search API is a broad, no-auth, public catalog that covers most Chinese
+//      pop artists (周杰伦, 五月天, 林俊杰, 田馥甄, ...). We use it as a last resort
+//      when QQ returns nothing.
 //
-// Search scoring re-uses the algorithms in LocalLyricService (Normalize / IsTitleMatch
-// / Score) so cover and lyric matches stay consistent. Duration signal is dropped
-// because the Win32 fallback cannot report duration.
+// Flow:
+//   1. search:  https://itunes.apple.com/search?term=<title artist>&entity=song&country=CN&limit=10
+//               → score results (Normalize / IsTitleMatch / Score, threshold 60)
+//   2. lookup:  https://itunes.apple.com/lookup?id=<collectionId>&entity=song&country=CN
+//               (kept for parity with the QQ two-step design; the search result already
+//                carries artworkUrl100, so we upscale that directly)
+//   3. artwork: artworkUrl100 "100x100bb.jpg" → replace with "600x600bb.jpg" → download
 //
-// Cache: in-memory LRU keyed by `Normalize(title)|Normalize(artist)`. Three states:
-//   Found(bytes), NotFound, Error. Only Found/NotFound are cached; Error retries on
-//   next call. Cap = 32 entries, TTL = 1h.
+// Notes:
+//   - iTunes requires the whole query be URL-encoded (Uri.EscapeDataString). Mixed
+//     Chinese + punctuation (e.g. "倔強") 400s if not encoded properly.
+//   - country=CN is required to surface China-region results.
+//   - Scoring uses trackName (single-song title) + artistName.
+//   - Cache: in-memory LRU keyed by Normalize(title)|Normalize(artist). Found/NotFound
+//     cached, Error retried. Cap = 32, TTL = 1h. Same pattern as QqMusicCoverLookupService.
 
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
@@ -28,7 +35,7 @@ using xiaoxu_music_bridge.Common;
 
 namespace xiaoxu_music_bridge.Media;
 
-public sealed class QqMusicCoverLookupService
+public sealed class ITunesCoverLookupService
 {
     private readonly HttpClient _httpClient;
     private readonly Dictionary<string, CacheEntry> _cache = new();
@@ -41,7 +48,7 @@ public sealed class QqMusicCoverLookupService
 
     private sealed record CacheEntry(CacheState State, byte[]? Bytes, string ContentType, DateTime ExpiresAt);
 
-    public QqMusicCoverLookupService(HttpClient httpClient)
+    public ITunesCoverLookupService(HttpClient httpClient)
     {
         _httpClient = httpClient;
     }
@@ -55,9 +62,8 @@ public sealed class QqMusicCoverLookupService
         var key = $"{Normalize(cleanedArtist)}|{Normalize(cleanedTitle)}";
 
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] [QQCover] GetCoverAsync called title='{cleanedTitle}' artist='{cleanedArtist}'\n");
+            $"[{DateTime.Now:HH:mm:ss}] [iTunes] GetCoverAsync called title='{cleanedTitle}' artist='{cleanedArtist}'\n");
 
-        // Cache lookup (Found/NotFound only — Error is retried each call)
         lock (_cacheLock)
         {
             if (_cache.TryGetValue(key, out var entry) && entry.ExpiresAt > DateTime.UtcNow && entry.State != CacheState.Error)
@@ -66,7 +72,7 @@ public sealed class QqMusicCoverLookupService
                     ? new CoverImage(entry.Bytes, entry.ContentType)
                     : null;
                 LogPaths.SafeAppend(LogPaths.DebugLog,
-                    $"[{DateTime.Now:HH:mm:ss}] [QQCover] cache hit state={entry.State} bytes={entry.Bytes?.Length ?? 0}\n");
+                    $"[{DateTime.Now:HH:mm:ss}] [iTunes] cache hit state={entry.State} bytes={entry.Bytes?.Length ?? 0}\n");
                 return hit;
             }
         }
@@ -81,19 +87,16 @@ public sealed class QqMusicCoverLookupService
         catch (Exception ex)
         {
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] SearchAndDownload EXCEPTION {ex.GetType().Name}: {ex.Message}\n");
-            // Swallow — fall through to NotFound caching
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] SearchAndDownload EXCEPTION {ex.GetType().Name}: {ex.Message}\n");
         }
 
         LogPaths.SafeAppend(LogPaths.DebugLog,
             result is not null
-                ? $"[{DateTime.Now:HH:mm:ss}] [QQCover] returning cover bytes={result.Bytes.Length}\n"
-                : $"[{DateTime.Now:HH:mm:ss}] [QQCover] returning null (miss / network error)\n");
+                ? $"[{DateTime.Now:HH:mm:ss}] [iTunes] returning cover bytes={result.Bytes.Length}\n"
+                : $"[{DateTime.Now:HH:mm:ss}] [iTunes] returning null (miss / network error)\n");
 
-        // Cache the result
         lock (_cacheLock)
         {
-            // Evict oldest entry if at capacity
             if (_cache.Count >= CacheCapacity)
             {
                 var oldestKey = _cache
@@ -116,78 +119,81 @@ public sealed class QqMusicCoverLookupService
 
     private async Task<CoverImage?> SearchAndDownloadAsync(string title, string artist, CancellationToken cancellationToken)
     {
-        string? albummid = null;
+        ITunesTrack? best = null;
         foreach (var query in GetSearchQueries(title, artist))
         {
-            albummid = await SearchForAlbummidAsync(query, title, artist, cancellationToken);
-            if (albummid is not null) break;
+            best = await SearchForTrackAsync(query, title, artist, cancellationToken);
+            if (best is not null) break;
         }
 
-        if (string.IsNullOrWhiteSpace(albummid))
+        if (best is null || string.IsNullOrWhiteSpace(best.ArtworkUrl100))
         {
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] no albummid matched (score below threshold or no results)\n");
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] no track matched (score below threshold or no artwork)\n");
             return null;
         }
 
-        // Try 500x500 first, fallback to 300x300
-        var url500 = $"https://y.gtimg.cn/music/photo_new/T002R500x500M{albummid}_1.jpg";
-        byte[]? bytes = await DownloadCoverAsync(url500, cancellationToken);
+        // artworkUrl100 looks like ".../source/100x100bb.jpg". Upscale to 600x600.
+        var hiResUrl = Regex.Replace(best.ArtworkUrl100, @"\d+x\d+bb", "600x600bb");
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] [iTunes] collectionId={best.CollectionId} downloading {hiResUrl}\n");
+
+        byte[]? bytes = await DownloadCoverAsync(hiResUrl, cancellationToken);
         if (bytes is null)
         {
-            var url300 = $"https://y.gtimg.cn/music/photo_new/T002R300x300M{albummid}_1.jpg";
+            // Fall back to the original 100x100 URL if the upscaled variant 404s.
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] 500x500 miss, trying 300x300 albummid={albummid}\n");
-            bytes = await DownloadCoverAsync(url300, cancellationToken);
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] 600x600 miss, trying original {best.ArtworkUrl100}\n");
+            bytes = await DownloadCoverAsync(best.ArtworkUrl100, cancellationToken);
         }
 
         return bytes is null ? null : new CoverImage(bytes, "image/jpeg");
     }
 
-    private async Task<string?> SearchForAlbummidAsync(string query, string title, string artist, CancellationToken cancellationToken)
+    private async Task<ITunesTrack?> SearchForTrackAsync(string query, string title, string artist, CancellationToken cancellationToken)
     {
-        var searchUrl = $"https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w={Uri.EscapeDataString(query)}&format=json&p=1&n=10";
+        // Encode the whole term — iTunes 400s on raw mixed CJK + punctuation.
+        var searchUrl = $"https://itunes.apple.com/search?term={Uri.EscapeDataString(query)}&entity=song&country=CN&limit=10";
 
-        QqDirectSearchResponse? search;
+        ITunesSearchResponse? search;
         try
         {
-            using var request = CreateQqRequest(searchUrl);
+            using var request = new HttpRequestMessage(HttpMethod.Get, searchUrl);
+            request.Headers.UserAgent.ParseAdd("Mozilla/5.0");
             using var response = await _httpClient.SendAsync(request, cancellationToken);
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] search query='{query}' status={(int)response.StatusCode}\n");
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] search query='{query}' status={(int)response.StatusCode}\n");
             if (!response.IsSuccessStatusCode) return null;
 
-            search = JsonSerializer.Deserialize<QqDirectSearchResponse>(
+            search = JsonSerializer.Deserialize<ITunesSearchResponse>(
                 await response.Content.ReadAsStringAsync(cancellationToken));
         }
         catch (Exception ex)
         {
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] search EXCEPTION query='{query}' {ex.GetType().Name}: {ex.Message}\n");
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] search EXCEPTION query='{query}' {ex.GetType().Name}: {ex.Message}\n");
             return null;
         }
 
-        var songs = search?.Data?.Song?.List;
-        if (songs is null || songs.Length == 0)
+        var tracks = search?.Results;
+        if (tracks is null || tracks.Length == 0)
         {
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] search query='{query}' returned 0 songs\n");
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] search query='{query}' returned 0 results\n");
             return null;
         }
 
-        // Pick best-scoring song; require score >= 60 (lower than lyric threshold 80
-        // because we lack duration signal in the fallback path).
-        var best = songs
-            .Where(s => !string.IsNullOrWhiteSpace(s.AlbumMid))
-            .OrderByDescending(s => Score(s, title, artist))
+        var best = tracks
+            .Where(t => !string.IsNullOrWhiteSpace(t.ArtworkUrl100))
+            .OrderByDescending(t => Score(t, title, artist))
             .FirstOrDefault();
 
         var bestScore = best is null ? -1000 : Score(best, title, artist);
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] [QQCover] query='{query}' songs={songs.Length} bestScore={bestScore} albummid={best?.AlbumMid ?? "(none)"} pass={(bestScore >= 60)}\n");
+            $"[{DateTime.Now:HH:mm:ss}] [iTunes] query='{query}' results={tracks.Length} bestScore={bestScore} track='{best?.TrackName ?? "(none)"}' pass={(bestScore >= 60)}\n");
 
         if (best is null || bestScore < 60) return null;
-        return best.AlbumMid;
+        return best;
     }
 
     private async Task<byte[]?> DownloadCoverAsync(string url, CancellationToken cancellationToken)
@@ -195,42 +201,32 @@ public sealed class QqMusicCoverLookupService
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Referrer = new Uri("https://y.qq.com/");
             request.Headers.UserAgent.ParseAdd("Mozilla/5.0");
             using var response = await _httpClient.SendAsync(request, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
                 LogPaths.SafeAppend(LogPaths.DebugLog,
-                    $"[{DateTime.Now:HH:mm:ss}] [QQCover] download status={(int)response.StatusCode} url={url}\n");
+                    $"[{DateTime.Now:HH:mm:ss}] [iTunes] download status={(int)response.StatusCode} url={url}\n");
                 return null;
             }
 
             var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
-            // Guard against empty / non-image payloads (CDN sometimes returns HTML)
             if (bytes.Length < 16)
             {
                 LogPaths.SafeAppend(LogPaths.DebugLog,
-                    $"[{DateTime.Now:HH:mm:ss}] [QQCover] download too small bytes={bytes.Length} url={url}\n");
+                    $"[{DateTime.Now:HH:mm:ss}] [iTunes] download too small bytes={bytes.Length} url={url}\n");
                 return null;
             }
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] download OK status=200 bytes={bytes.Length}\n");
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] download OK status=200 bytes={bytes.Length}\n");
             return bytes;
         }
         catch (Exception ex)
         {
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] download EXCEPTION {ex.GetType().Name}: {ex.Message} url={url}\n");
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] download EXCEPTION {ex.GetType().Name}: {ex.Message} url={url}\n");
             return null;
         }
-    }
-
-    private static HttpRequestMessage CreateQqRequest(string url)
-    {
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Referrer = new Uri("https://y.qq.com/");
-        request.Headers.UserAgent.ParseAdd("Mozilla/5.0");
-        return request;
     }
 
     private static IEnumerable<string> GetSearchQueries(string title, string artist)
@@ -242,17 +238,17 @@ public sealed class QqMusicCoverLookupService
         yield return title;
     }
 
-    private static int Score(QqDirectSong song, string title, string artist)
+    private static int Score(ITunesTrack track, string title, string artist)
     {
         var score = 0;
-        var songName = Normalize(song.SongName);
-        var artistName = Normalize(string.Join(" ", song.Singer.Select(item => item.Name)));
+        var trackName = Normalize(track.TrackName ?? "");
+        var artistName = Normalize(track.ArtistName ?? "");
         var wantedTitle = Normalize(title);
         var wantedArtist = Normalize(artist);
 
-        if (!IsTitleMatch(songName, wantedTitle)) return -1000;
-        if (songName == wantedTitle) score += 100;
-        else if (songName.Contains(wantedTitle) || wantedTitle.Contains(songName)) score += 45;
+        if (!IsTitleMatch(trackName, wantedTitle)) return -1000;
+        if (trackName == wantedTitle) score += 100;
+        else if (trackName.Contains(wantedTitle) || wantedTitle.Contains(trackName)) score += 45;
 
         if (!string.IsNullOrWhiteSpace(wantedArtist))
         {
@@ -260,8 +256,10 @@ public sealed class QqMusicCoverLookupService
             else if (artistName.Contains(wantedArtist) || wantedArtist.Contains(artistName)) score += 35;
         }
 
-        if (song.SongName.Contains("伴奏", StringComparison.OrdinalIgnoreCase)) score -= 100;
-        if (song.SongName.Contains("翻自", StringComparison.OrdinalIgnoreCase)) score -= 30;
+        var rawTrack = track.TrackName ?? "";
+        if (rawTrack.Contains("伴奏", StringComparison.OrdinalIgnoreCase)) score -= 100;
+        if (rawTrack.Contains("Instrumental", StringComparison.OrdinalIgnoreCase)) score -= 100;
+        if (rawTrack.Contains("Live", StringComparison.OrdinalIgnoreCase)) score -= 20;
         return score;
     }
 
@@ -292,22 +290,14 @@ public sealed class QqMusicCoverLookupService
                 || wantedTitle.Contains(candidateTitle));
     }
 
-    // DTO subset of client_search_cp response
-    private sealed record QqDirectSearchResponse(
-        [property: JsonPropertyName("data")] QqDirectSearchData? Data);
+    // DTO subset of the iTunes Search / Lookup response.
+    private sealed record ITunesSearchResponse(
+        [property: JsonPropertyName("resultCount")] int ResultCount,
+        [property: JsonPropertyName("results")] ITunesTrack[] Results);
 
-    private sealed record QqDirectSearchData(
-        [property: JsonPropertyName("song")] QqDirectSongResult? Song);
-
-    private sealed record QqDirectSongResult(
-        [property: JsonPropertyName("list")] QqDirectSong[] List);
-
-    private sealed record QqDirectSong(
-        [property: JsonPropertyName("songmid")] string SongMid,
-        [property: JsonPropertyName("songname")] string SongName,
-        [property: JsonPropertyName("singer")] QqSinger[] Singer,
-        [property: JsonPropertyName("albummid")] string AlbumMid);
-
-    private sealed record QqSinger(
-        [property: JsonPropertyName("name")] string Name);
+    private sealed record ITunesTrack(
+        [property: JsonPropertyName("collectionId")] long CollectionId,
+        [property: JsonPropertyName("trackName")] string? TrackName,
+        [property: JsonPropertyName("artistName")] string? ArtistName,
+        [property: JsonPropertyName("artworkUrl100")] string? ArtworkUrl100);
 }

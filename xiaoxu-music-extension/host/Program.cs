@@ -34,6 +34,7 @@ DateTime gsmtcSkipUntil = DateTime.MinValue; // circuit breaker
 // Shared HttpClient for lyric + cover lookup services (avoids socket-pool fragmentation)
 var sharedHttp = new HttpClient();
 var coverLookup = new QqMusicCoverLookupService(sharedHttp);
+var itunesCoverLookup = new ITunesCoverLookupService(sharedHttp);
 var lyricService = new LocalLyricService(lyricsDir, sharedHttp);
 
 // Audio beat service - captures system audio and computes bass/volume/pulse
@@ -112,7 +113,7 @@ while (true)
             "getStatus" => await HandleGetStatus(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip),
             "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, doc.RootElement),
             "getLyrics" => await HandleGetLyrics(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
-            "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, GsmtcCircuitBreaker.ShouldSkip),
+            "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, itunesCoverLookup, GsmtcCircuitBreaker.ShouldSkip),
             "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, stdout, stdoutLock),
             "unsubscribeBeat" => HandleUnsubscribeBeat(ref beatService),
             "getBeat" => HandleGetBeat(beatService),
@@ -402,11 +403,84 @@ static async Task<string> HandleGetCover(
     WindowsMediaSessionService gsmtc,
     Win32MediaService fallback,
     QqMusicCoverLookupService coverLookup,
+    ITunesCoverLookupService itunesLookup,
     Func<bool> shouldSkipGsmtc)
 {
-    // TIER 1: GSMTC normal + has cover → return base64 directly
-    // TIER 2: GSMTC normal but cover is null → return null (don't try QQ lookup for non-QQ sources)
-    // TIER 3: GSMTC skipped / timed out → Win32 fallback for title/artist → QQ Music cover lookup
+    // TIER 1  : GSMTC alive + native cover        → return base64 directly
+    // TIER 2  : GSMTC alive, cover=null, QQ-ish    → QQ lookup → iTunes lookup
+    // TIER 2b : GSMTC alive, cover=null, non-QQ    → Win32 title/artist → iTunes lookup
+    // TIER 3  : GSMTC skipped / timed out          → Win32 title/artist → QQ lookup → iTunes lookup
+    // TIER 4  : (built into 2/2b/3) iTunes is the last-resort source everywhere.
+    //
+    // Each source is tried in sequence; a miss flows to the next source rather than
+    // short-circuiting the whole handler.
+
+    // --- Local helpers ------------------------------------------------------
+
+    // Run QQ then iTunes for a given title/artist. Returns serialized cover JSON
+    // on the first hit, or null if both miss.
+    async Task<string?> TryQqThenItunes(string? title, string? artist, bool viaFallback)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return null;
+
+        var (qqCover, qqTimedOut) = await WithTimeout(
+            coverLookup.GetCoverAsync(title, artist, CancellationToken.None), 5000, "QqMusicCoverLookup");
+        if (qqTimedOut)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] HandleGetCover QQ lookup TIMEOUT for title={title}\n");
+        }
+        else if (qqCover is not null)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] HandleGetCover QQ lookup OK bytes={qqCover.Bytes.Length} for title={title}\n");
+            return SerializeCover(qqCover, viaFallback);
+        }
+
+        return await TryItunes(title, artist, viaFallback);
+    }
+
+    // Run iTunes for a given title/artist. Returns serialized cover JSON on hit, or null.
+    async Task<string?> TryItunes(string? title, string? artist, bool viaFallback)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return null;
+
+        var (itCover, itTimedOut) = await WithTimeout(
+            itunesLookup.GetCoverAsync(title, artist, CancellationToken.None), 5000, "ITunesCoverLookup");
+        if (itTimedOut)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] HandleGetCover iTunes lookup TIMEOUT for title={title}\n");
+            return null;
+        }
+        if (itCover is not null)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] HandleGetCover iTunes lookup OK bytes={itCover.Bytes.Length} for title={title}\n");
+            return SerializeCover(itCover, viaFallback);
+        }
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover iTunes lookup null for title={title}\n");
+        return null;
+    }
+
+    static string SerializeCover(CoverImage cover, bool viaFallback) => JsonSerializer.Serialize(new
+    {
+        type = "cover",
+        data = Convert.ToBase64String(cover.Bytes),
+        contentType = cover.ContentType,
+        viaFallback
+    });
+
+    static string NoCover(bool viaFallback) => JsonSerializer.Serialize(new
+    {
+        type = "cover",
+        data = (string?)null,
+        contentType = (string?)null,
+        viaFallback
+    });
+
+    // --- GSMTC path (Tier 1 / 2 / 2b) ---------------------------------------
 
     if (!shouldSkipGsmtc())
     {
@@ -418,93 +492,71 @@ static async Task<string> HandleGetCover(
             if (cover is not null)
             {
                 // Tier 1: native cover from GSMTC
-                return JsonSerializer.Serialize(new
-                {
-                    type = "cover",
-                    data = Convert.ToBase64String(cover.Bytes),
-                    contentType = cover.ContentType,
-                    viaFallback = false
-                });
+                return SerializeCover(cover, viaFallback: false);
             }
-            // Tier 2: GSMTC alive but no native cover. For QQ Music we can still try
-            // the public QQ Music search API to find an album thumb. For other sources
-            // we have no fallback path - return null.
+
+            // GSMTC alive but no native cover. Read its metadata to decide the next source.
             var (gsmtcStatus, statusTimedOut) = await WithTimeout(
                 gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forCover)");
-            if (!statusTimedOut && string.Equals(gsmtcStatus.Source, "QQMusic", StringComparison.Ordinal)
-                && !string.IsNullOrWhiteSpace(gsmtcStatus.Title))
+
+            if (!statusTimedOut)
             {
-                                var (tier2Cover, tier2TimedOut) = await WithTimeout(
-                    coverLookup.GetCoverAsync(gsmtcStatus.Title, gsmtcStatus.Artist, CancellationToken.None),
-                    5000, "QqMusicCoverLookup(tier2)");
-                if (tier2TimedOut)
+                string sourceRaw = gsmtcStatus.Source ?? "(null)";
+                bool isQqMusic = sourceRaw.Equals("QQMusic", StringComparison.OrdinalIgnoreCase)
+                              || sourceRaw.Contains("QQ", StringComparison.OrdinalIgnoreCase)
+                              || sourceRaw.Contains("Tencent", StringComparison.OrdinalIgnoreCase);
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss}] HandleGetCover Tier2 sourceRaw='{sourceRaw}' isQqMusic={isQqMusic} title={gsmtcStatus.Title}\n");
+
+                if (isQqMusic && !string.IsNullOrWhiteSpace(gsmtcStatus.Title))
                 {
-                    LogPaths.SafeAppend(LogPaths.DebugLog,
-                        $"[{DateTime.Now:HH:mm:ss}] HandleGetCover Tier2 QQ lookup TIMEOUT for title={gsmtcStatus.Title}\n");
-                }
-                else if (tier2Cover is not null)
-                {
-                    LogPaths.SafeAppend(LogPaths.DebugLog,
-                        $"[{DateTime.Now:HH:mm:ss}] HandleGetCover Tier2 QQ lookup OK bytes={tier2Cover.Bytes.Length} for title={gsmtcStatus.Title}\n");
-                    return JsonSerializer.Serialize(new
-                    {
-                        type = "cover",
-                        data = Convert.ToBase64String(tier2Cover.Bytes),
-                        contentType = tier2Cover.ContentType,
-                        viaFallback = false
-                    });
+                    // Tier 2: QQ Music → iTunes
+                    var t2 = await TryQqThenItunes(gsmtcStatus.Title, gsmtcStatus.Artist, viaFallback: false);
+                    if (t2 is not null) return t2;
                 }
                 else
                 {
-                    LogPaths.SafeAppend(LogPaths.DebugLog,
-                        $"[{DateTime.Now:HH:mm:ss}] HandleGetCover Tier2 QQ lookup null for title={gsmtcStatus.Title}\n");
+                    // Tier 2b: non-QQ source with no native cover. QQ lookup is pointless
+                    // (song isn't in QQ's catalog by source), so go straight to iTunes.
+                    // Prefer GSMTC's own title/artist; fall back to Win32 if GSMTC has none.
+                    string? title = gsmtcStatus.Title;
+                    string? artist = gsmtcStatus.Artist;
+                    if (string.IsNullOrWhiteSpace(title))
+                    {
+                        var win32 = await fallback.GetStatusAsync(CancellationToken.None);
+                        title = win32.Title;
+                        artist = win32.Artist;
+                        LogPaths.SafeAppend(LogPaths.DebugLog,
+                            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover Tier2b using Win32 title={title}\n");
+                    }
+                    var t2b = await TryItunes(title, artist, viaFallback: false);
+                    if (t2b is not null) return t2b;
                 }
             }
-            return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = false });
+
+            return NoCover(viaFallback: false);
         }
         GsmtcHealthTracker.RecordFailure("GetCurrentCoverAsync");
         GsmtcCircuitBreaker.Open();
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT → Win32 fallback + QQ cover lookup\n");
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT → Win32 fallback + QQ/iTunes cover lookup\n");
     }
     else
     {
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC skipped (circuit breaker open) → Win32 fallback + QQ cover lookup\n");
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC skipped (circuit breaker open) → Win32 fallback + QQ/iTunes cover lookup\n");
     }
 
-    // Tier 3: GSMTC unavailable — read title/artist from Win32 daemon title, then query QQ Music
+    // --- Tier 3: GSMTC unavailable — Win32 title/artist → QQ → iTunes -------
+
     var fbStatus = await fallback.GetStatusAsync(CancellationToken.None);
     if (string.IsNullOrWhiteSpace(fbStatus.Title))
     {
-        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
+        return NoCover(viaFallback: true);
     }
 
-    var (qqCover, qqTimedOut) = await WithTimeout(
-        coverLookup.GetCoverAsync(fbStatus.Title, fbStatus.Artist, CancellationToken.None),
-        5000, "QqMusicCoverLookup");
-    if (qqTimedOut)
-    {
-        LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover QQ lookup TIMEOUT for title={fbStatus.Title}\n");
-        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
-    }
-    if (qqCover is null)
-    {
-        LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover QQ lookup null for title={fbStatus.Title}\n");
-        return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null, viaFallback = true });
-    }
-
-    LogPaths.SafeAppend(LogPaths.DebugLog,
-        $"[{DateTime.Now:HH:mm:ss}] HandleGetCover QQ lookup OK bytes={qqCover.Bytes.Length} for title={fbStatus.Title}\n");
-    return JsonSerializer.Serialize(new
-    {
-        type = "cover",
-        data = Convert.ToBase64String(qqCover.Bytes),
-        contentType = qqCover.ContentType,
-        viaFallback = true
-    });
+    var tier3 = await TryQqThenItunes(fbStatus.Title, fbStatus.Artist, viaFallback: true);
+    return tier3 ?? NoCover(viaFallback: true);
 }
 
 static string HandleSubscribeBeat(ref AudioBeatService? service, ref AudioDebugServer? debugServer, Stream stdout, object stdoutLock)
