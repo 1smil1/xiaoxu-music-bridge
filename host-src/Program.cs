@@ -198,6 +198,7 @@ static async Task<string> HandleGetStatus(IMediaSessionService mediaService)
         mediaService.GetStatusAsync(CancellationToken.None), 5000, "GetStatusAsync");
     if (timedOut)
     {
+        GsmtcHealthTracker.RecordFailure("GetStatusAsync");
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus TIMEOUT — returning empty status (GSMTC likely hung)\n");
         return JsonSerializer.Serialize(new
@@ -219,6 +220,8 @@ static async Task<string> HandleGetStatus(IMediaSessionService mediaService)
 
     LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] Status: title={status.Title}, artist={status.Artist}, hasCover={status.CoverUrl is not null}\n");
+
+    GsmtcHealthTracker.RecordSuccess();
 
     return JsonSerializer.Serialize(new
     {
@@ -270,6 +273,7 @@ static async Task<string> HandleGetLyrics(IMediaSessionService mediaService, Loc
         mediaService.GetStatusAsync(CancellationToken.None), 5000, "GetStatusAsync(forLyrics)");
     if (statusTimedOut)
     {
+        GsmtcHealthTracker.RecordFailure("GetStatusAsync(forLyrics)");
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics TIMEOUT on status — returning no-lyrics\n");
         return JsonSerializer.Serialize(new
@@ -286,6 +290,7 @@ static async Task<string> HandleGetLyrics(IMediaSessionService mediaService, Loc
     }
     LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] Lyrics: title={status.Title}, artist={status.Artist}\n");
+    GsmtcHealthTracker.RecordSuccess();
     var (lyrics, lyricsTimedOut) = await WithTimeout(
         lyricService.GetCurrentLyricsAsync(status, CancellationToken.None), 5000, "GetCurrentLyricsAsync");
     if (lyricsTimedOut)
