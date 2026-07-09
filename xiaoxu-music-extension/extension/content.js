@@ -1,7 +1,24 @@
 // content.js — Bridge between page (injected.js) and background (background.js)
 // Injected into xiaoxu.xin pages. Runs in content script world (has chrome.runtime access).
+//
+// Single long-lived port ("xiaoxu-bridge") handles EVERYTHING:
+//   - bridgeRequest (page fetch → host) and bridgeResponse
+//   - BEAT_SUBSCRIBE / BEAT_UNSUBSCRIBE
+//   - BEAT_UPDATE push from background → page
+//
+// Why one port: an open chrome.runtime.Port keeps the MV3 service worker
+// alive indefinitely. The previous design (sendMessage + separate beat-port)
+// was killed by Chrome after ~30s of inactivity, causing
+// "host unavailable (503)" + "message port closed" on every fresh poll.
+// A long-lived port is the standard fix for this.
 
 console.log('[xiaoxu-music] content script loaded, url:', location.href);
+
+// Inject the fetch interceptor into the PAGE context via script.src (bypasses CSP)
+const script = document.createElement('script');
+script.src = chrome.runtime.getURL('injected.js');
+(document.head || document.documentElement).appendChild(script);
+script.remove();
 
 function postBridgeError(fetchId, message) {
   window.postMessage({
@@ -14,107 +31,135 @@ function postBridgeError(fetchId, message) {
   }, '*');
 }
 
-// Inject the fetch interceptor into the PAGE context via script.src (bypasses CSP)
-const script = document.createElement('script');
-script.src = chrome.runtime.getURL('injected.js');
-(document.head || document.documentElement).appendChild(script);
-script.remove();
+// ---- Single long-lived port ----
 
-// Listen for bridge fetch requests from the injected script
-window.addEventListener('message', (e) => {
-  if (e.source !== window) return;
-  if (e.data?.type !== 'BRIDGE_FETCH') return;
+let port = null;
+let reconnectTimer = null;
+let reqId = 0;
+const pending = new Map(); // _bridgeFetchId → { resolve, reject }
 
-  console.log('[xiaoxu-music] BRIDGE_FETCH received:', e.data.url, e.data.method);
-
+function openPort() {
+  if (port) return;
   try {
-    chrome.runtime.sendMessage(
-      { type: 'bridgeRequest', url: e.data.url, method: e.data.method },
-      (response) => {
-        const lastError = chrome.runtime.lastError;
-        console.log('[xiaoxu-music] sendMessage callback, lastError:', lastError?.message, 'response:', response);
-        if (lastError) {
-          postBridgeError(e.data._bridgeFetchId, lastError.message || 'Extension runtime unavailable');
-          return;
-        }
-
-        window.postMessage({
-          _bridgeFetchResponse: true,
-          _bridgeFetchId: e.data._bridgeFetchId,
-          ...response,
-        }, '*');
-      }
-    );
-  } catch (error) {
-    const message = error && typeof error.message === 'string' ? error.message : 'Extension runtime unavailable';
-    console.warn('[xiaoxu-music] sendMessage failed:', message);
-    postBridgeError(e.data._bridgeFetchId, message);
+    port = chrome.runtime.connect({ name: 'xiaoxu-bridge' });
+  } catch (e) {
+    console.warn('[xiaoxu-music] connect failed:', e.message);
+    scheduleReconnect();
+    return;
   }
-});
 
-// ---- Beat stream: page → content → background → page ----
-// Page calls window.postMessage({type:'BEAT_SUBSCRIBE'}) to start receiving beats.
-// Background pushes BEAT_UPDATE messages here; we forward to page via postMessage.
+  port.onMessage.addListener((msg) => {
+    // bridgeResponse for a pending fetch
+    if (msg && msg._bridgeFetchId != null && pending.has(msg._bridgeFetchId)) {
+      const cb = pending.get(msg._bridgeFetchId);
+      pending.delete(msg._bridgeFetchId);
+      cb(msg);
+      return;
+    }
 
-let beatPort = null;
+    // Beat push
+    if (msg && msg.type === 'BEAT_UPDATE') {
+      const out = {
+        type: 'BEAT_UPDATE',
+        bass: msg.bass ?? 0,
+        volume: msg.volume ?? 0,
+        pulse: msg.pulse ?? 0,
+        glow: msg.glow ?? 0,
+      };
+      if (msg.bands) out.bands = msg.bands;
+      if (msg.features) out.features = msg.features;
+      if (msg.onsets) out.onsets = msg.onsets;
+      if (msg.rhythm) out.rhythm = msg.rhythm;
+      if (msg.state) out.state = msg.state;
+      if (typeof msg.ts === 'number') out.ts = msg.ts;
+      window.postMessage(out, '*');
+      return;
+    }
+
+    if (msg && msg.type === 'BEAT_DISCONNECTED') {
+      window.postMessage({ type: 'BEAT_DISCONNECTED' }, '*');
+      return;
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError;
+    console.warn('[xiaoxu-music] bridge port disconnected, lastError:', err?.message);
+    port = null;
+    // Reject all pending fetches so the page's await Promise resolves with 503
+    for (const [, cb] of pending) {
+      cb({ error: err?.message || 'Bridge port disconnected', status: 503 });
+    }
+    pending.clear();
+    scheduleReconnect();
+  });
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    openPort();
+  }, 1000);
+}
+
+// Open immediately so the service worker is kept alive as soon as the page loads
+openPort();
+
+// ---- Page → extension message router ----
 
 window.addEventListener('message', (e) => {
   if (e.source !== window) return;
   const data = e.data;
   if (!data) return;
 
-  if (data.type === 'BEAT_SUBSCRIBE') {
-    // Use a long-lived port to receive async beat pushes from background
-    if (beatPort) {
-      // Already subscribed — just ack
-      window.postMessage({ type: 'BEAT_SUBSCRIBE_ACK', ok: true }, '*');
+  if (data.type === 'BRIDGE_FETCH') {
+    if (!port) {
+      postBridgeError(data._bridgeFetchId, 'Bridge port not connected');
       return;
     }
+    const id = ++reqId;
     try {
-      beatPort = chrome.runtime.connect({ name: 'beat-port' });
-      beatPort.onMessage.addListener((msg) => {
-        if (msg.type === 'BEAT_UPDATE') {
-          // Forward to page — include v3 fields when present so the 12-event
-          // rhythm pool can evaluate onsets/centroid/silence/etc.
-          const out = {
-            type: 'BEAT_UPDATE',
-            bass: msg.bass ?? 0,
-            volume: msg.volume ?? 0,
-            pulse: msg.pulse ?? 0,
-            glow: msg.glow ?? 0,
-          };
-          if (msg.bands) out.bands = msg.bands;
-          if (msg.features) out.features = msg.features;
-          if (msg.onsets) out.onsets = msg.onsets;
-          if (msg.rhythm) out.rhythm = msg.rhythm;
-          if (msg.state) out.state = msg.state;
-          if (typeof msg.ts === 'number') out.ts = msg.ts;
-          window.postMessage(out, '*');
+      port.postMessage({
+        type: 'bridgeRequest',
+        _bridgeFetchId: id,
+        url: data.url,
+        method: data.method,
+      });
+      pending.set(id, (response) => {
+        if (response && response.error) {
+          postBridgeError(data._bridgeFetchId, response.error);
+        } else {
+          window.postMessage({
+            _bridgeFetchResponse: true,
+            _bridgeFetchId: data._bridgeFetchId,
+            ok: response?.ok !== false,
+            status: response?.status ?? 200,
+            data: response?.data,
+          }, '*');
         }
       });
-      beatPort.onDisconnect.addListener(() => {
-        beatPort = null;
-        window.postMessage({ type: 'BEAT_DISCONNECTED' }, '*');
-      });
+    } catch (e) {
+      pending.delete(id);
+      postBridgeError(data._bridgeFetchId, e.message);
+    }
+    return;
+  }
 
-      // Tell background to start beat stream
-      chrome.runtime.sendMessage({ type: 'BEAT_SUBSCRIBE' }, (resp) => {
-        window.postMessage({ type: 'BEAT_SUBSCRIBE_ACK', ok: !!resp?.ok }, '*');
-      });
-    } catch (err) {
-      window.postMessage({ type: 'BEAT_SUBSCRIBE_ACK', ok: false, error: err?.message }, '*');
+  if (data.type === 'BEAT_SUBSCRIBE') {
+    // Beat subscription is implicit — the port is already open. The background
+    // starts AudioBeatService as soon as the port connects, so just ack.
+    if (port) {
+      window.postMessage({ type: 'BEAT_SUBSCRIBE_ACK', ok: true }, '*');
+    } else {
+      // Port not yet up — ack false so the page knows to retry
+      window.postMessage({ type: 'BEAT_SUBSCRIBE_ACK', ok: false, error: 'Bridge port not connected' }, '*');
     }
     return;
   }
 
   if (data.type === 'BEAT_UNSUBSCRIBE') {
-    if (beatPort) {
-      try {
-        chrome.runtime.sendMessage({ type: 'BEAT_UNSUBSCRIBE' }, () => {});
-      } catch (e) {}
-      try { beatPort.disconnect(); } catch (e) {}
-      beatPort = null;
-    }
+    // No-op: beat is bound to the port lifetime, not a separate subscription
     return;
   }
 });
