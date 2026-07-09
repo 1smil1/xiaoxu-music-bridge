@@ -13,7 +13,7 @@ using xiaoxu_music_bridge.Common;
 try
 {
 // Log IMMEDIATELY — before any service initialization
-File.AppendAllText(LogPaths.DebugLog,
+LogPaths.SafeAppend(LogPaths.DebugLog,
     $"[{DateTime.Now:HH:mm:ss}] HOST STARTING (logPath={LogPaths.DebugLog}), args=[{string.Join(", ", args)}], cwd={Environment.CurrentDirectory}\n");
 
 // Chrome Native Messaging passes the extension origin as args[0] (e.g. "chrome-extension://...")
@@ -33,10 +33,10 @@ var stdoutLock = new object();
 // AudioBeatService is attached (which happens on first subscribeBeat).
 debugServer = new AudioDebugServer(null);
 debugServer.Start();
-File.AppendAllText(LogPaths.DebugLog,
+LogPaths.SafeAppend(LogPaths.DebugLog,
     $"[{DateTime.Now:HH:mm:ss}] AudioDebugServer STARTED on http://localhost:17889/ (waiting for AudioBeatService)\n");
 
-File.AppendAllText(LogPaths.DebugLog,
+LogPaths.SafeAppend(LogPaths.DebugLog,
     $"[{DateTime.Now:HH:mm:ss}] INIT OK, lyricsDir={lyricsDir}\n");
 
 var stdin = Console.OpenStandardInput();
@@ -65,7 +65,7 @@ while (true)
     // Log raw message only when not a ping (pings spam the log)
     if (!json.Contains("\"ping\""))
     {
-        File.AppendAllText(LogPaths.DebugLog,
+        LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] RAW msg: len={messageLength}, text={json}\n");
     }
 
@@ -115,7 +115,7 @@ while (true)
     }
     catch (Exception ex)
     {
-        File.AppendAllText(LogPaths.DebugLog,
+        LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] EXCEPTION: type={ex.GetType().Name}, msg={ex.Message}\n{ex.StackTrace}\n");
         responseJson = JsonSerializer.Serialize(new { type = "error", message = ex.Message });
 
@@ -184,7 +184,7 @@ static async Task<(T Result, bool TimedOut)> WithTimeout<T>(Task<T> task, int ti
             string status = t.IsCompletedSuccessfully
                 ? "completed_late"
                 : $"faulted:{t.Exception?.GetType().Name}:{t.Exception?.Message}";
-            File.AppendAllText(LogPaths.DebugLog,
+            LogPaths.SafeAppend(LogPaths.DebugLog,
                 $"[{DateTime.Now:HH:mm:ss}] LATE {opName} {status}\n");
         });
         return (default!, true);
@@ -198,7 +198,7 @@ static async Task<string> HandleGetStatus(IMediaSessionService mediaService)
         mediaService.GetStatusAsync(CancellationToken.None), 5000, "GetStatusAsync");
     if (timedOut)
     {
-        File.AppendAllText(LogPaths.DebugLog,
+        LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus TIMEOUT — returning empty status (GSMTC likely hung)\n");
         return JsonSerializer.Serialize(new
         {
@@ -217,7 +217,7 @@ static async Task<string> HandleGetStatus(IMediaSessionService mediaService)
         });
     }
 
-    File.AppendAllText(LogPaths.DebugLog,
+    LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] Status: title={status.Title}, artist={status.Artist}, hasCover={status.CoverUrl is not null}\n");
 
     return JsonSerializer.Serialize(new
@@ -252,7 +252,7 @@ static async Task<string> HandleControl(IMediaSessionService mediaService, JsonE
         mediaService.SendCommandAsync(command, CancellationToken.None), 5000, "SendCommandAsync");
     if (timedOut)
     {
-        File.AppendAllText(LogPaths.DebugLog,
+        LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleControl TIMEOUT — control={commandStr}\n");
         return JsonSerializer.Serialize(new { type = "controlResult", ok = false, error = "control timeout (GSMTC hung)" });
     }
@@ -270,7 +270,7 @@ static async Task<string> HandleGetLyrics(IMediaSessionService mediaService, Loc
         mediaService.GetStatusAsync(CancellationToken.None), 5000, "GetStatusAsync(forLyrics)");
     if (statusTimedOut)
     {
-        File.AppendAllText(LogPaths.DebugLog,
+        LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics TIMEOUT on status — returning no-lyrics\n");
         return JsonSerializer.Serialize(new
         {
@@ -284,13 +284,13 @@ static async Task<string> HandleGetLyrics(IMediaSessionService mediaService, Loc
             synced = false
         });
     }
-    File.AppendAllText(LogPaths.DebugLog,
+    LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] Lyrics: title={status.Title}, artist={status.Artist}\n");
     var (lyrics, lyricsTimedOut) = await WithTimeout(
         lyricService.GetCurrentLyricsAsync(status, CancellationToken.None), 5000, "GetCurrentLyricsAsync");
     if (lyricsTimedOut)
     {
-        File.AppendAllText(LogPaths.DebugLog,
+        LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics TIMEOUT on lyric fetch — returning no-lyrics\n");
         return JsonSerializer.Serialize(new
         {
@@ -304,7 +304,7 @@ static async Task<string> HandleGetLyrics(IMediaSessionService mediaService, Loc
             synced = false
         });
     }
-    File.AppendAllText(LogPaths.DebugLog,
+    LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] Lyrics result: found={lyrics.Found}, source={lyrics.Source}, lrcLen={lyrics.Lrc?.Length ?? 0}\n");
     return JsonSerializer.Serialize(new
     {
@@ -325,7 +325,7 @@ static async Task<string> HandleGetCover(IMediaSessionService mediaService)
         mediaService.GetCurrentCoverAsync(CancellationToken.None), 5000, "GetCurrentCoverAsync");
     if (timedOut)
     {
-        File.AppendAllText(LogPaths.DebugLog,
+        LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetCover TIMEOUT — returning null cover\n");
         return JsonSerializer.Serialize(new { type = "cover", data = (string?)null, contentType = (string?)null });
     }
@@ -360,11 +360,11 @@ static string HandleSubscribeBeat(ref AudioBeatService? service, ref AudioDebugS
         {
             service.AttachDebugServer(debugServer);
             debugServer.SetBeatService(service);
-            File.AppendAllText(LogPaths.DebugLog,
+            LogPaths.SafeAppend(LogPaths.DebugLog,
                 $"[{DateTime.Now:HH:mm:ss}] AudioBeatService ATTACHED to AudioDebugServer\n");
         }
 
-        File.AppendAllText(LogPaths.DebugLog,
+        LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] AudioBeatService STARTED\n");
     }
     service.Subscribe();
@@ -397,6 +397,6 @@ static string HandleGetBeat(AudioBeatService? service)
 }
 catch (Exception ex)
 {
-    File.AppendAllText(LogPaths.DebugLog,
+    LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] FATAL: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}\n");
 }

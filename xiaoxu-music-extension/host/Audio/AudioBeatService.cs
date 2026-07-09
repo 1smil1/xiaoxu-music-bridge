@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using xiaoxu_music_bridge.Common;
 
 namespace xiaoxu_music_bridge.Audio;
 
@@ -29,7 +30,7 @@ public sealed class AudioBeatService : IDisposable
     private const int FftSize = 2048;
     private const int HopSize = 1024;        // 50% overlap
     private const int PushIntervalMs = 33;   // ~30Hz
-    private const string DebugLog = @"C:\Users\nuaa_xuzike\xiaoxu-debug.log";
+    private static readonly string DebugLog = LogPaths.DebugLog;
 
     private WasapiLoopbackCapture? _capture;
     private Thread? _pushThread;
@@ -459,12 +460,10 @@ public sealed class AudioBeatService : IDisposable
 
     private static void Log(string msg)
     {
-        try
-        {
-            File.AppendAllText(DebugLog,
-                $"[{DateTime.Now:HH:mm:ss.fff}] [AudioBeatService] {msg}\n");
-        }
-        catch { }
+        // SafeAppend handles file-lock contention when Chrome respawns the host
+        // mid-overlap with the dying old instance — never throws, never blocks.
+        LogPaths.SafeAppend(DebugLog,
+            $"[{DateTime.Now:HH:mm:ss.fff}] [AudioBeatService] {msg}\n");
     }
 }
 

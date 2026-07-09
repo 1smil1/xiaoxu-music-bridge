@@ -460,12 +460,10 @@ public sealed class AudioBeatService : IDisposable
 
     private static void Log(string msg)
     {
-        try
-        {
-            File.AppendAllText(DebugLog,
-                $"[{DateTime.Now:HH:mm:ss.fff}] [AudioBeatService] {msg}\n");
-        }
-        catch { }
+        // SafeAppend handles file-lock contention when Chrome respawns the host
+        // mid-overlap with the dying old instance — never throws, never blocks.
+        LogPaths.SafeAppend(DebugLog,
+            $"[{DateTime.Now:HH:mm:ss.fff}] [AudioBeatService] {msg}\n");
     }
 }
 

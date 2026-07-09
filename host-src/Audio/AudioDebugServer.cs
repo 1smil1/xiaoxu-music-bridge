@@ -150,7 +150,7 @@ public sealed class AudioDebugServer : IDisposable
             {
                 Thread.Sleep(1000);
                 string json = GetRawJson();
-                File.AppendAllText(LiveLogPath, json + "\n");
+                LogPaths.SafeAppend(LiveLogPath, json + "\n");
             }
             catch (Exception ex)
             {
@@ -303,12 +303,10 @@ public sealed class AudioDebugServer : IDisposable
 
     private static void Log(string msg)
     {
-        try
-        {
-            File.AppendAllText(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss.fff}] [AudioDebugServer] {msg}\n");
-        }
-        catch { }
+        // SafeAppend handles file-lock contention when Chrome respawns the host
+        // mid-overlap with the dying old instance — never throws, never blocks.
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss.fff}] [AudioDebugServer] {msg}\n");
     }
 }
 

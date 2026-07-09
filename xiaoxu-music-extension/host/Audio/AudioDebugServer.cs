@@ -23,13 +23,14 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using xiaoxu_music_bridge.Common;
 
 namespace xiaoxu_music_bridge.Audio;
 
 public sealed class AudioDebugServer : IDisposable
 {
     private const int Port = 17889;
-    private const string LiveLogPath = @"C:\Users\nuaa_xuzike\xiaoxu-audio-live.log";
+    private static readonly string LiveLogPath = LogPaths.AudioLiveLog;
     private const int MaxHistory = 100;
     private const int HealthWindowSec = 10;
 
@@ -149,7 +150,7 @@ public sealed class AudioDebugServer : IDisposable
             {
                 Thread.Sleep(1000);
                 string json = GetRawJson();
-                File.AppendAllText(LiveLogPath, json + "\n");
+                LogPaths.SafeAppend(LiveLogPath, json + "\n");
             }
             catch (Exception ex)
             {
@@ -302,12 +303,10 @@ public sealed class AudioDebugServer : IDisposable
 
     private static void Log(string msg)
     {
-        try
-        {
-            File.AppendAllText(@"C:\Users\nuaa_xuzike\xiaoxu-debug.log",
-                $"[{DateTime.Now:HH:mm:ss.fff}] [AudioDebugServer] {msg}\n");
-        }
-        catch { }
+        // SafeAppend handles file-lock contention when Chrome respawns the host
+        // mid-overlap with the dying old instance — never throws, never blocks.
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss.fff}] [AudioDebugServer] {msg}\n");
     }
 }
 
