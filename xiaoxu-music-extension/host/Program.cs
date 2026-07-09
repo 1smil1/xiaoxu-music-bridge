@@ -16,6 +16,11 @@ try
 LogPaths.SafeAppend(LogPaths.DebugLog,
     $"[{DateTime.Now:HH:mm:ss}] HOST STARTING (logPath={LogPaths.DebugLog}), args=[{string.Join(", ", args)}], cwd={Environment.CurrentDirectory}\n");
 
+// Log initial GSMTC health snapshot (note: this also resets a stale persisted count)
+var initialHealth = GsmtcHealthTracker.GetSnapshot();
+LogPaths.SafeAppend(LogPaths.DebugLog,
+    $"[{DateTime.Now:HH:mm:ss}] GSMTC health at startup: totalRestarts={initialHealth.TotalRestarts}, stuck={initialHealth.IsStuck}\n");
+
 // Chrome Native Messaging passes the extension origin as args[0] (e.g. "chrome-extension://...")
 // Skip it — only use args that look like valid local paths
 var lyricsDir = args.FirstOrDefault(a => !a.StartsWith("chrome-extension://") && Path.IsPathRooted(a));
@@ -102,6 +107,7 @@ while (true)
             "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, stdout, stdoutLock),
             "unsubscribeBeat" => HandleUnsubscribeBeat(ref beatService),
             "getBeat" => HandleGetBeat(beatService),
+            "getGsmtcHealth" => HandleGetGsmtcHealth(),
             _ => JsonSerializer.Serialize(new { type = "error", message = $"Unknown command: {type}" })
         };
 
@@ -396,6 +402,20 @@ static string HandleGetBeat(AudioBeatService? service)
         volume = Math.Round(result.volume, 3),
         pulse = Math.Round(result.pulse, 3),
         glow = Math.Round(result.glow, 3)
+    });
+}
+
+static string HandleGetGsmtcHealth()
+{
+    var snap = GsmtcHealthTracker.GetSnapshot();
+    return JsonSerializer.Serialize(new
+    {
+        type = "gsmtcHealth",
+        consecutiveFailures = snap.ConsecutiveFailures,
+        totalRestarts = snap.TotalRestarts,
+        lastSuccessAt = snap.LastSuccessAt?.ToString("o"),
+        isStuck = snap.IsStuck,
+        stuckThreshold = GsmtcHealthTracker.StuckThreshold,
     });
 }
 

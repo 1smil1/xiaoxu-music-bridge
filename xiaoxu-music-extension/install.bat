@@ -107,5 +107,18 @@ if exist "C:\Program Files\Google\Chrome\Application\chrome.exe" (
     echo  [WARN] 未找到 Chrome，请手动启动
 )
 
+echo.
+echo  [6/5] Creating desktop shortcut for audio recovery...
+set "RECOVERY_BAT=%INSTALL_DIR%\restart-audio.bat"
+set "DESKTOP=%USERPROFILE%\Desktop"
+set "SHORTCUT=%DESKTOP%\重启音频服务 (xiaoxu-music-bridge).lnk"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT%'); $s.TargetPath = '%RECOVERY_BAT%'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.WindowStyle = 1; $s.Description = 'Restart Windows Audio services to clear GSMTC deadlock'; $s.IconLocation = 'mmcbase.dll,1'; $s.Save()" >nul 2>&1
+if exist "%SHORTCUT%" (
+    echo  [6/5] OK - shortcut: %SHORTCUT%
+) else (
+    echo  [6/5] FAILED - shortcut not created
+)
+echo.
+
 echo  按任意键关闭此窗口...
 pause >nul
