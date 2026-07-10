@@ -726,6 +726,12 @@ public sealed class BridgeHttpServer : IDisposable
         ctx.Response.Headers.Add("Access-Control-Allow-Origin", allowOrigin);
         ctx.Response.Headers.Add("Vary", "Origin");
         ctx.Response.Headers.Add("Access-Control-Allow-Methods", AllowMethods);
+        // v3.2.7 hotfix: Chrome 130+ enforces Private Network Access (PNA) for
+        // https:// → http://localhost fetches. Without this header the browser
+        // returns 503 to JS and the dashboard's /state/current polling never
+        // succeeds → lyrics frozen on first song. Echo on both the actual
+        // response and the OPTIONS preflight.
+        ctx.Response.Headers.Add("Access-Control-Allow-Private-Network", "true");
         if (includeAllowHeaders)
         {
             ctx.Response.Headers.Add("Access-Control-Allow-Headers", AllowHeaders);
