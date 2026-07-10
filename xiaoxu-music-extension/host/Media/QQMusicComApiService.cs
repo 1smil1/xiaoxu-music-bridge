@@ -1,34 +1,37 @@
 // QQMusicComApiService — primary position source for the Win32 fallback path.
 //
-// v3.2.7: GSMTC is permanently broken on the user's machine (WinRT projection
-// DLL missing from single-file publish — see GsmtcHealthTracker.IsPermanentlyBroken).
-// UIA was a partial fix in v3.2.3, but QQ Music's CEF-rendered UI doesn't expose
-// a Slider/ProgressBar to UIA at all (1437 nodes walked, zero sliders). So neither
-// GSMTC nor UIA can give us real position.
+// v3.2.7: GSMTC permanently broken (WinRT projection DLL missing from single-file
+// publish — see GsmtcHealthTracker.IsPermanentlyBroken). UIA doesn't expose a
+// Slider/ProgressBar in QQ Music's CEF UI tree. New: QQ Music ships a hidden
+// COM API window called `csQQMusicComApiWnd2017` (title `QQMusic_COM_WND_<UUID>`)
+// that accepts WM_COPYDATA with `player/playerstatus` action and replies via a
+// registered window message back to the caller's HWND.
 //
-// What does work: QQ Music ships a hidden COM-API window called
-// `csQQMusicComApiWnd2017` (title `QQMusic_COM_WND_<UUID>`). This window accepts
-// WM_COPYDATA messages with XML/JSON payloads describing actions like
-// `player/playerstatus` and (per the reverse-engineered protocol) replies via a
-// registered window message back to the caller's HWND. Protocol isn't
-// officially documented — community reverse-engineering. We try the action name
-// `player/playerstatus` first; if it returns empty, we'd expand the action list.
+// v3.2.7 HOTFIX — SendMessage deadlock fix:
 //
-// Threading: WM_COPYDATA SendMessage must be sent from a thread that pumps a
-// Windows message loop, otherwise the reply window message can be delivered to
-// the wrong thread or get queued indefinitely. So we run a dedicated STA thread
-// that:
-//   1. Registers a unique reply window class + creates a message-only window.
-//   2. Pumps GetMessageW/DispatchMessageW forever.
-//   3. Accepts request tasks via TaskScheduler.StartNew(... _staScheduler),
-//      which runs the SendMessage on the STA thread.
-//   4. The WndProc hands the reply (delivered as another WM_COPYDATA whose
-//      dwData carries the request id we chose) to the matching TaskCompletionSource.
+//   First implementation called SendMessage(W) on the dedicated STA thread that
+//   also pumped the reply WndProc. That deadlocks:
+//     1. STA thread calls SendMessage(QQMusic, WM_COPYDATA, ourHwnd, &cds)
+//     2. QQ Music's WndProc runs, then replies via SendMessage(ourHwnd, replyMsgId, ...)
+//     3. That SendMessage from QQ Music blocks until OUR WndProc returns
+//     4. Our WndProc can only run when our STA pump calls DispatchMessageW
+//     5. But our STA thread is blocked in step 1's SendMessage → pump not running
+//     6. → DEADLOCK. Reply never arrives. 1s timeout always triggers. positionMs stays 0.
 //
-// Timeout: 1 second. The dashboard polls /state/current at ~1 Hz; we want the
-// whole fallback chain (title from daemon window + position from COM API) to
-// complete inside that budget. If QQ Music is sluggish or hung we degrade to
-// position=0 and let the beat-based rAF gate on the frontend decide play/pause.
+//   New design:
+//     - STA thread does ONE thing only: pump GetMessageW/DispatchMessageW forever.
+//     - Sender is a worker thread pool task that calls SendMessageTimeout
+//       (500ms timeout). QQ Music's WndProc runs on QQ Music's thread, replies
+//       via SendMessage(ourHwnd, ...) which queues a sent-message on our
+//       STA thread's queue, our DispatchMessageW runs our WndProc, WndProc
+//       sets TCS, returns. No deadlock.
+//     - Caller awaits the TCS via Task.WhenAny with a 1s timeout.
+//
+// v3.2.7 HOTFIX — caching:
+//   Dashboard polls /state/current at ~1Hz; sending a fresh WM_COPYDATA on
+//   every poll hammers QQ Music (which is fine, but unnecessary). Cache the
+//   parsed status by (title|artist) for 250ms; reuse within that window. On
+//   song change the cache key flips → fresh request fires immediately.
 
 using System;
 using System.Collections.Concurrent;
@@ -45,9 +48,7 @@ namespace xiaoxu_music_bridge.Media;
 
 public sealed class QQMusicComApiService : IDisposable
 {
-    // Candidate window class names, newest first. QQ Music's COM API window
-    // class has changed across major versions; we list the known ones and stop
-    // at the first hit. New versions can be added here.
+    // Candidate window class names, newest first. New versions can be added.
     private static readonly string[] WindowClasses = new[]
     {
         "csQQMusicComApiWnd2017",
@@ -57,27 +58,43 @@ public sealed class QQMusicComApiService : IDisposable
     };
 
     private const int WM_COPYDATA = 0x004A;
+    private const uint SMTO_NORMAL = 0x0000;
+    private const int RequestTimeoutMs = 500;
+    private const int OverallTimeoutMs = 1000;
+    private static readonly TimeSpan StatusCacheTtl = TimeSpan.FromMilliseconds(250);
+
     private static readonly IntPtr HWND_MESSAGE = new(-3);
 
     private IntPtr _comApiHwnd;
     private IntPtr _ourReplyHwnd;
     private string _ourReplyClassName = "";
     private uint _replyMsgId;
-    private WndProcDelegate? _wndProcDelegate; // GC pin
-    private readonly ConcurrentDictionary<uint, TaskCompletionSource<string>> _pending = new();
+    private WndProcDelegate? _wndProcDelegate;
+    private readonly ConcurrentDictionary<uint, PendingRequest> _pending = new();
     private int _nextReqId;
 
-    // STA pump — SendMessage WM_COPYDATA + WndProc reply both need a thread
-    // pumping messages. TaskScheduler that schedules onto this thread.
-    private readonly Thread _staThread;
-    private readonly BlockingCollection<Action> _staQueue = new();
+    // v3.2.7 HOTFIX: simple cache by (title|artist). On a song switch the
+    // cache key changes and we fire a fresh request immediately.
+    private readonly object _statusCacheLock = new();
+    private string _statusCacheKey = "";
+    private MediaStatus? _statusCacheValue;
+    private DateTime _statusCacheAt;
+    private DateTime _lastWindowNotFoundLogAt = DateTime.MinValue;
+
+    // v3.2.7 HOTFIX: STA thread is now a PURE message pump. No action queue,
+    // no SendMessage calls on this thread. This breaks the deadlock.
+    private Thread? _staThread;
     private volatile bool _staRunning;
+
+    private const string PlayerStatusXml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+        "<QQMusic><Action>player/playerstatus</Action></QQMusic>";
 
     public QQMusicComApiService()
     {
         _staThread = new Thread(StaThreadMain)
         {
-            Name = "QQMusicComApi-STA",
+            Name = "QQMusicComApi-Pump",
             IsBackground = true,
         };
         // STA must be set BEFORE Start (see Win32MediaService v3.2.5 lesson).
@@ -89,9 +106,8 @@ public sealed class QQMusicComApiService : IDisposable
     {
         _staRunning = true;
 
-        // Register a unique window class so we can be sure no other process
-        // collides with us. RegisterWindowMessage gives us a globally-unique
-        // message id that QQ Music can use to address replies to us.
+        // Register a globally-unique reply message id. QQ Music's WndProc (per
+        // community reverse-engineering) sends its reply with this same id.
         _replyMsgId = RegisterWindowMessageW("XiaoxuMusicBridge_ComApi_Reply_v1");
 
         _wndProcDelegate = WndProc;
@@ -110,7 +126,6 @@ public sealed class QQMusicComApiService : IDisposable
             Log($"[ComApi] RegisterClassExW failed err={Marshal.GetLastWin32Error()}");
         }
 
-        // Message-only window — invisible, no taskbar entry, never shown.
         _ourReplyHwnd = CreateWindowExW(
             0, _ourReplyClassName, "XiaoxuMusicBridge-ComApiReply",
             0, 0, 0, 0, 0,
@@ -120,20 +135,14 @@ public sealed class QQMusicComApiService : IDisposable
             Log($"[ComApi] CreateWindowExW failed err={Marshal.GetLastWin32Error()}");
         }
 
-        // Standard message pump. We don't use a TaskScheduler — we just
-        // marshal calls onto this thread via _staQueue so the SendMessage
-        // and WndProc reply stay on the same apartment.
+        // Pure message pump. This is the ONLY thing this thread does — that's
+        // the deadlock fix.
         while (_staRunning)
         {
-            // TryGetMessage with non-blocking peek so we can also drain our
-            // internal queue between windows messages. (Real-world load is
-            // negligible so this is fine.)
             IntPtr got = GetMessageW(out var msg, IntPtr.Zero, 0, 0);
-            if (got == 0 || got == -1) break; // WM_QUIT or error
+            if (got == 0 || got == -1) break;
             TranslateMessage(ref msg);
             DispatchMessageW(ref msg);
-            // Drain any queued SendMessage tasks between windows messages
-            while (_staQueue.TryTake(out var action, 0)) action();
         }
     }
 
@@ -141,9 +150,9 @@ public sealed class QQMusicComApiService : IDisposable
     {
         if (msg == _replyMsgId && lParam != IntPtr.Zero)
         {
-            // QQ Music sends the response as WM_COPYDATA in the registered
-            // message. lpData of the COPYDATASTRUCT carries the UTF-8 bytes,
-            // dwData carries our request id (we set it on send).
+            // QQ Music replies with WM_COPYDATA in the registered message. The
+            // COPYDATASTRUCT lives only during this DispatchMessageW call, so
+            // we must decode and stash the bytes immediately.
             var cds = Marshal.PtrToStructure<COPYDATASTRUCT>(lParam);
             if (cds.cbData > 0 && cds.lpData != IntPtr.Zero)
             {
@@ -154,13 +163,13 @@ public sealed class QQMusicComApiService : IDisposable
                     var responseXml = Encoding.UTF8.GetString(bytes);
                     var reqId = unchecked((uint)cds.dwData.ToInt64());
                     Log($"[ComApi] RAW response len={responseXml.Length} reqId={reqId}: {TruncateForLog(responseXml, 240)}");
-                    if (_pending.TryRemove(reqId, out var tcs))
+                    if (_pending.TryRemove(reqId, out var pending))
                     {
-                        tcs.TrySetResult(responseXml);
+                        pending.ResponseTcs.TrySetResult(responseXml);
                     }
                     else
                     {
-                        Log($"[ComApi] reply for unknown reqId={reqId}");
+                        Log($"[ComApi] reply for unknown/timed-out reqId={reqId}");
                     }
                 }
                 catch (Exception ex)
@@ -174,162 +183,178 @@ public sealed class QQMusicComApiService : IDisposable
     }
 
     /// <summary>
-    /// Ask QQ Music for current player status (position, duration, isPlaying,
-    /// title, artist). Returns null if the COM API window can't be found,
-    /// the request times out, or the response can't be parsed.
-    ///
-    /// Safe to call from any thread — internally marshals onto the STA pump.
+    /// Ask QQ Music for current player status. Returns null if the COM API
+    /// window can't be found, the request times out, or the response can't
+    /// be parsed. Safe to call from any thread.
     /// </summary>
-    public Task<MediaStatus?> GetPlayerStatusAsync(CancellationToken ct)
+    public Task<MediaStatus?> GetPlayerStatusAsync(string? title, string? artist, CancellationToken ct)
     {
-        var tcs = new TaskCompletionSource<MediaStatus?>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        // Enqueue the whole SendMessage attempt onto the STA thread so we
-        // don't race the WndProc reply dispatch.
-        _staQueue.Add(() =>
+        // v3.2.7 HOTFIX: cache by (title|artist). Dashboard polls ~1Hz so on
+        // most polls we return the cached value without touching QQ Music.
+        var cacheKey = $"{title ?? ""}|{artist ?? ""}";
+        lock (_statusCacheLock)
         {
-            try
+            if (_statusCacheKey == cacheKey
+                && _statusCacheValue != null
+                && DateTime.UtcNow - _statusCacheAt < StatusCacheTtl)
             {
-                var result = GetPlayerStatusOnSta(ct);
-                tcs.TrySetResult(result);
-            }
-            catch (Exception ex)
-            {
-                Log($"[ComApi] STA GetPlayerStatus failed: {ex.GetType().Name}: {ex.Message}");
-                tcs.TrySetResult(null);
-            }
-        });
-
-        return tcs.Task;
-    }
-
-    private MediaStatus? GetPlayerStatusOnSta(CancellationToken ct)
-    {
-        // Locate COM API window lazily + re-scan if it went away (QQ Music
-        // can restart its listener window on version upgrade / crash).
-        if (_comApiHwnd == IntPtr.Zero || !IsWindow(_comApiHwnd))
-        {
-            _comApiHwnd = IntPtr.Zero;
-            foreach (var cls in WindowClasses)
-            {
-                var h = FindWindowW(cls, null);
-                if (h != IntPtr.Zero)
-                {
-                    _comApiHwnd = h;
-                    Log($"[ComApi] found window class={cls} hwnd={h.ToInt64()}");
-                    break;
-                }
-            }
-            if (_comApiHwnd == IntPtr.Zero)
-            {
-                // First-deploy debug: surface which classes we tried.
-                Log($"[ComApi] COM API window not found (tried: {string.Join(", ", WindowClasses)})");
-                return null;
+                return Task.FromResult<MediaStatus?>(_statusCacheValue);
             }
         }
+
+        var comApiHwnd = EnsureComApiHwnd();
+        if (comApiHwnd == IntPtr.Zero) return Task.FromResult<MediaStatus?>(null);
         if (_ourReplyHwnd == IntPtr.Zero)
         {
             Log("[ComApi] reply window not created — STA init failed");
-            return null;
+            return Task.FromResult<MediaStatus?>(null);
         }
 
         var reqId = unchecked((uint)Interlocked.Increment(ref _nextReqId));
-        var xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                  "<QQMusic><Action>player/playerstatus</Action></QQMusic>";
-
         var responseTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[reqId] = responseTcs;
+        _pending[reqId] = new PendingRequest(responseTcs, Environment.TickCount);
 
-        byte[] payload;
-        try
-        {
-            payload = Encoding.UTF8.GetBytes(xml);
-        }
-        catch (Exception ex)
-        {
-            _pending.TryRemove(reqId, out _);
-            Log($"[ComApi] payload encode failed: {ex.Message}");
-            return null;
-        }
+        // Send WM_COPYDATA from a worker thread pool task, NOT the STA pump.
+        // The pump is blocked in GetMessageW waiting for replies; if we called
+        // SendMessage from it, we'd deadlock (see file-header comment).
+        var payloadBytes = Encoding.UTF8.GetBytes(PlayerStatusXml);
+        Task.Run(() => SendCopyDataOnWorker(comApiHwnd, reqId, payloadBytes));
 
-        var pinned = GCHandle.Alloc(payload, GCHandleType.Pinned);
+        return AwaitWithTimeoutAsync(responseTcs.Task, TimeSpan.FromMilliseconds(OverallTimeoutMs), ct)
+            .ContinueWith(t =>
+            {
+                // Always remove from pending dict + free resources (no pinned
+                // payload to free in this design — we kept it inside the worker).
+                _pending.TryRemove(reqId, out _);
+
+                if (t.IsFaulted)
+                {
+                    var ex = t.Exception?.GetBaseException();
+                    Log($"[ComApi] reqId={reqId} fault: {ex?.GetType().Name}: {ex?.Message}");
+                    return null;
+                }
+                if (!t.IsCompletedSuccessfully)
+                {
+                    // Timeout — already logged in AwaitWithTimeoutAsync
+                    return null;
+                }
+
+                MediaStatus? parsed;
+                try { parsed = ParsePlayerStatusXml(t.Result); }
+                catch (Exception ex)
+                {
+                    Log($"[ComApi] reqId={reqId} parse failed: {ex.GetType().Name}: {ex.Message}");
+                    return null;
+                }
+                if (parsed == null) return null;
+
+                // v3.2.7 HOTFIX: stick the result into the per-song cache so
+                // the next poll within 250ms returns instantly.
+                lock (_statusCacheLock)
+                {
+                    _statusCacheKey = cacheKey;
+                    _statusCacheValue = parsed;
+                    _statusCacheAt = DateTime.UtcNow;
+                }
+                return (MediaStatus?)parsed;
+            });
+    }
+
+    private IntPtr EnsureComApiHwnd()
+    {
+        // FindWindowW is thread-safe; call from any thread.
+        if (_comApiHwnd != IntPtr.Zero && IsWindow(_comApiHwnd)) return _comApiHwnd;
+        _comApiHwnd = IntPtr.Zero;
+        foreach (var cls in WindowClasses)
+        {
+            var h = FindWindowW(cls, null);
+            if (h != IntPtr.Zero)
+            {
+                _comApiHwnd = h;
+                Log($"[ComApi] found window class={cls} hwnd={h.ToInt64()}");
+                break;
+            }
+        }
+        if (_comApiHwnd == IntPtr.Zero)
+        {
+            // Throttle: only log once per 30s when window genuinely isn't there.
+            if ((DateTime.UtcNow - _lastWindowNotFoundLogAt).TotalSeconds > 30)
+            {
+                Log($"[ComApi] COM API window not found (tried: {string.Join(", ", WindowClasses)})");
+                _lastWindowNotFoundLogAt = DateTime.UtcNow;
+            }
+            return IntPtr.Zero;
+        }
+        return _comApiHwnd;
+    }
+
+    private void SendCopyDataOnWorker(IntPtr hwnd, uint reqId, byte[] payload)
+    {
+        // Pin the payload so GC can't move it while the kernel reads it.
+        var handle = GCHandle.Alloc(payload, GCHandleType.Pinned);
+        var cdsPtr = Marshal.AllocHGlobal(Marshal.SizeOf<COPYDATASTRUCT>());
         try
         {
             var cds = new COPYDATASTRUCT
             {
                 dwData = (IntPtr)reqId,
                 cbData = payload.Length,
-                lpData = pinned.AddrOfPinnedObject(),
+                lpData = handle.AddrOfPinnedObject(),
             };
-            // wParam = our reply HWND per community reverse-engineered protocol.
-            // (Some variants expect wParam=0; if responses never arrive after
-            // first deploy, try 0 here.)
-            var sendResult = SendMessage(_comApiHwnd, WM_COPYDATA, _ourReplyHwnd, ref cds);
-            Log($"[ComApi] sent reqId={reqId} sendResult={sendResult.ToInt64()} (TRUE={sendResult != IntPtr.Zero})");
+            Marshal.StructureToPtr(cds, cdsPtr, false);
+
+            IntPtr wndProcResult;
+            // SendMessageTimeout returns 0 on timeout (no WndProc call) or
+            // non-zero on success. The reply comes via our HWND's registered
+            // window message (handled by WndProc on the STA pump thread).
+            var sendResult = SendMessageTimeout(
+                hwnd, WM_COPYDATA, _ourReplyHwnd, cdsPtr,
+                SMTO_NORMAL, RequestTimeoutMs, out wndProcResult);
+
+            if (sendResult == IntPtr.Zero)
+            {
+                // Timed out — QQ Music didn't process within 500ms. Don't
+                // fail the TCS yet; reply can still come later (until the
+                // caller's 1s overall timeout). Just log.
+                Log($"[ComApi] reqId={reqId} SendMessageTimeout TIMEOUT after {RequestTimeoutMs}ms (QQ Music slow or window hung)");
+            }
+            else
+            {
+                Log($"[ComApi] reqId={reqId} SendMessageTimeout OK wndProcResult={wndProcResult.ToInt64()}");
+            }
         }
         catch (Exception ex)
         {
-            _pending.TryRemove(reqId, out _);
-            Log($"[ComApi] SendMessage THREW: {ex.GetType().Name}: {ex.Message}");
-            return null;
+            Log($"[ComApi] reqId={reqId} SendMessageTimeout THREW: {ex.GetType().Name}: {ex.Message}");
+            if (_pending.TryRemove(reqId, out var pending))
+            {
+                pending.ResponseTcs.TrySetException(ex);
+            }
         }
         finally
         {
-            pinned.Free();
+            Marshal.FreeHGlobal(cdsPtr);
+            try { handle.Free(); } catch { }
         }
+    }
 
-        // Wait for reply up to 1s. We can't `await` here because we're on the
-        // STA thread inside an Action; instead poll with a short sleep loop
-        // that yields to the message pump by calling Thread.Sleep (the
-        // BlockingCollection.TryTake on _staQueue in StaThreadMain also helps
-        // drain background work).
-        var deadline = Environment.TickCount + 1000;
-        while (Environment.TickCount < deadline)
+    private static async Task<string> AwaitWithTimeoutAsync(Task<string> task, TimeSpan timeout, CancellationToken ct)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var delayTask = Task.Delay(timeout, cts.Token);
+        var winner = await Task.WhenAny(task, delayTask);
+        if (winner == task)
         {
-            if (ct.IsCancellationRequested)
-            {
-                _pending.TryRemove(reqId, out _);
-                return null;
-            }
-            if (responseTcs.Task.IsCompleted) break;
-            Thread.Sleep(20);
+            cts.Cancel();
+            return await task; // propagate exceptions / result
         }
-
-        if (!responseTcs.Task.IsCompleted)
-        {
-            _pending.TryRemove(reqId, out _);
-            Log($"[ComApi] reqId={reqId} timeout (1s)");
-            return null;
-        }
-
-        string responseXml;
-        try
-        {
-            responseXml = responseTcs.Task.Result;
-        }
-        catch (Exception ex)
-        {
-            Log($"[ComApi] reqId={reqId} reply fault: {ex.GetType().Name}: {ex.Message}");
-            return null;
-        }
-
-        try
-        {
-            return ParsePlayerStatusXml(responseXml);
-        }
-        catch (Exception ex)
-        {
-            Log($"[ComApi] parse failed: {ex.GetType().Name}: {ex.Message}");
-            return null;
-        }
+        throw new TimeoutException($"QQMusicComApi request timed out after {timeout.TotalMilliseconds:F0}ms");
     }
 
     private static MediaStatus? ParsePlayerStatusXml(string xml)
     {
         if (string.IsNullOrWhiteSpace(xml)) return null;
 
-        // Some QQ Music versions reply with JSON instead of XML. Try XML first
-        // (the documented/observed shape), fall back to JSON.
         try
         {
             var doc = new XmlDocument();
@@ -399,10 +424,8 @@ public sealed class QQMusicComApiService : IDisposable
         }
     }
 
-    // QQ Music state code meaning: not officially documented. We default to
-    // "code 1 = playing", but the first successful raw response log will
-    // reveal the actual mapping. To make the heuristic robust we also treat
-    // state==2 as playing (some versions use 2 for playing, 1 for paused).
+    // QQ Music state code is undocumented. Default to {1,2}=playing, others=stopped.
+    // First raw response in debug.log will confirm — adjust if wrong.
     private static bool InterpretIsPlaying(int stateCode)
     {
         if (stateCode == 1 || stateCode == 2) return true;
@@ -493,15 +516,11 @@ public sealed class QQMusicComApiService : IDisposable
         try
         {
             _staRunning = false;
-            // Post WM_QUIT to our message pump so it exits cleanly.
             if (_ourReplyHwnd != IntPtr.Zero)
             {
                 PostMessage(_ourReplyHwnd, 0x0012 /* WM_QUIT */, IntPtr.Zero, IntPtr.Zero);
             }
-            if (_staThread.IsAlive)
-            {
-                _staThread.Join(500);
-            }
+            _staThread?.Join(500);
             if (_ourReplyHwnd != IntPtr.Zero)
             {
                 DestroyWindow(_ourReplyHwnd);
@@ -511,14 +530,20 @@ public sealed class QQMusicComApiService : IDisposable
             {
                 UnregisterClassW(_ourReplyClassName, GetModuleHandleW(null));
             }
-            _staQueue.CompleteAdding();
-            _staQueue.Dispose();
+            // Best-effort: cancel any pending TCS so awaiting callers don't hang.
+            foreach (var kv in _pending)
+            {
+                kv.Value.ResponseTcs.TrySetCanceled();
+            }
+            _pending.Clear();
         }
         catch (Exception ex)
         {
             Log($"[ComApi] Dispose error: {ex.GetType().Name}: {ex.Message}");
         }
     }
+
+    private sealed record PendingRequest(TaskCompletionSource<string> ResponseTcs, int CreatedAtTick);
 
     // ---- P/Invoke --------------------------------------------------------
 
@@ -567,9 +592,6 @@ public sealed class QQMusicComApiService : IDisposable
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool IsWindow(IntPtr hWnd);
 
-    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-    private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref COPYDATASTRUCT lParam);
-
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern ushort RegisterWindowMessageW(string lpString);
 
@@ -590,6 +612,11 @@ public sealed class QQMusicComApiService : IDisposable
 
     [DllImport("user32.dll")]
     private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(
+        IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam,
+        uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetMessageW(out MSG lpMsg, IntPtr hWnd, uint wMin, uint wMax);

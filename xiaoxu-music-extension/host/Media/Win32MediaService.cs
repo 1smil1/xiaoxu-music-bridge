@@ -104,7 +104,7 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
         protected override IEnumerable<Task> GetScheduledTasks() => _queue.ToArray();
     }
 
-    public Task<MediaStatus> GetStatusAsync(CancellationToken cancellationToken)
+    public async Task<MediaStatus> GetStatusAsync(CancellationToken cancellationToken)
     {
         var (daemonTitle, daemonArtist) = ReadQqMusicTitleAndArtist();
         if (daemonTitle == null && daemonArtist == null)
@@ -112,15 +112,18 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
             // No QQ Music track loaded — reset UIA state so the next track's
             // first poll doesn't think the song is paused.
             lock (_uiaLock) { _lastUiaValue = double.NaN; _lastUiaIsPlaying = false; }
-            return Task.FromResult(MediaStatus.NoMedia());
+            return MediaStatus.NoMedia();
         }
         bool hasTrack = !string.IsNullOrWhiteSpace(daemonTitle);
 
-        // v3.2.7: Try COM API first (real position via WM_COPYDATA). If the
-        // window can't be found or the request times out, fall back to UIA.
-        // Either way, title/artist come from the daemon window as the most
-        // reliable source across QQ Music versions (the COM API may omit them
-        // on some versions — see `player/playerstatus` schema variance).
+        // v3.2.7 HOTFIX: race the COM API against a 500ms deadline. If it
+        // returns in time, use it; otherwise return immediately with
+        // daemon-window title/artist only (no live position). The poll loop
+        // calls us at ~1Hz so the next attempt will fire within ~1s.
+        //
+        // This replaces the v3.2.7-initial `comTask.Wait(1500)` synchronous
+        // wait that made every /state/current block the worker thread for
+        // 1.5s — that's why song-switch UI felt laggy.
         long posMs = 0, durMs = 0;
         bool isPlaying = false;
         string? title = daemonTitle;
@@ -128,25 +131,35 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
 
         try
         {
-            // Synchronous wait — the COM API task has its own 1s timeout inside,
-            // so this is bounded even if the STA pump is stuck.
-            var comTask = _comApi.GetPlayerStatusAsync(CancellationToken.None);
-            if (comTask.Wait(1500) && comTask.Result is { } comStatus)
+            var comTask = _comApi.GetPlayerStatusAsync(daemonTitle, daemonArtist, cancellationToken);
+            var comTimeout = Task.Delay(500, cancellationToken);
+            var winner = await Task.WhenAny(comTask, comTimeout);
+            if (winner == comTask)
             {
-                if (comStatus.PositionMs > 0) posMs = comStatus.PositionMs;
-                if (comStatus.DurationMs > 0) durMs = comStatus.DurationMs;
-                // Trust COM API's isPlaying only if we got real values
-                if (comStatus.PositionMs > 0 || comStatus.DurationMs > 0)
+                var comStatus = await comTask;
+                if (comStatus != null)
                 {
-                    isPlaying = comStatus.IsPlaying;
+                    if (comStatus.PositionMs > 0) posMs = comStatus.PositionMs;
+                    if (comStatus.DurationMs > 0) durMs = comStatus.DurationMs;
+                    if (comStatus.PositionMs > 0 || comStatus.DurationMs > 0)
+                    {
+                        isPlaying = comStatus.IsPlaying;
+                    }
+                    if (!string.IsNullOrWhiteSpace(comStatus.Title)) title = comStatus.Title;
+                    if (!string.IsNullOrWhiteSpace(comStatus.Artist)) artist = comStatus.Artist;
+                    LogPaths.SafeAppend(LogPaths.DebugLog,
+                        $"[{DateTime.Now:HH:mm:ss}] [ComApi] pos={posMs}ms dur={durMs}ms playing={isPlaying} title='{title}' artist='{artist}'\n");
                 }
-                // Prefer COM API's title/artist when present (more accurate
-                // e.g. for unicode normalization). Fall back to daemon window.
-                if (!string.IsNullOrWhiteSpace(comStatus.Title)) title = comStatus.Title;
-                if (!string.IsNullOrWhiteSpace(comStatus.Artist)) artist = comStatus.Artist;
-                LogPaths.SafeAppend(LogPaths.DebugLog,
-                    $"[{DateTime.Now:HH:mm:ss}] [ComApi] pos={posMs}ms dur={durMs}ms playing={isPlaying} title='{title}' artist='{artist}'\n");
             }
+            else
+            {
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss}] [ComApi] slow (>500ms) — returning daemon-window-only this poll\n");
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -154,10 +167,8 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
                 $"[{DateTime.Now:HH:mm:ss}] [ComApi] GetPlayerStatusAsync wrapper caught (degraded): {ex.GetType().Name}: {ex.Message}\n");
         }
 
-        // Fallback: UIA — if COM API gave us nothing (window not found / parse
-        // failed / timeout) and we have a QQ Music PID, try reading the
-        // slider. v3.2.5 left this defensive (catch broadly so a broken UIA
-        // stack can't kill the whole fallback chain).
+        // Fallback: UIA — only if COM API gave us no useful position data.
+        // Same defensive try/catch as v3.2.5.
         if (posMs == 0 && durMs == 0)
         {
             var procs = Process.GetProcessesByName(QQMusicProcessName);
@@ -196,7 +207,7 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
             }
         }
 
-        return Task.FromResult(new MediaStatus(
+        return new MediaStatus(
             Connected: true,
             Source: hasTrack ? "QQMusic" : null,
             Title: title,
@@ -206,7 +217,7 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
             IsPlaying: isPlaying,
             PositionMs: posMs,
             DurationMs: durMs,
-            UpdatedAt: DateTimeOffset.Now));
+            UpdatedAt: DateTimeOffset.Now);
     }
 
     public Task<ControlResult> SendCommandAsync(ControlCommand command, CancellationToken cancellationToken)
