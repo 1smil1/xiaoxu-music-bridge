@@ -178,8 +178,20 @@ while (true)
         }
     }
 
-    // Write response
-    WriteMessage(stdout, responseJson, stdoutLock);
+    // Write response — if stdout pipe is broken (Chrome killed the SW / host),
+    // WriteMessage throws. v3.2.7 hotfix: log it and break out of the loop so the
+    // host exits cleanly with a stack trace instead of dying silently (which made
+    // /state/current polling hang on "host unavailable 503" with no diagnostic).
+    try
+    {
+        WriteMessage(stdout, responseJson, stdoutLock);
+    }
+    catch (Exception writeEx)
+    {
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] WriteMessage FAILED (Chrome probably killed the SW): {writeEx.GetType().Name}: {writeEx.Message}\n");
+        break;
+    }
 }
 
 // Cleanup
