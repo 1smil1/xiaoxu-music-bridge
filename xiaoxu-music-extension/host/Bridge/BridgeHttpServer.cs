@@ -142,17 +142,26 @@ public sealed class BridgeHttpServer : IDisposable
         try
         {
             _listener = new HttpListener();
-            // 127.0.0.1 only — spec § 安全边界: local API must NOT be reachable
-            // from the LAN. Localhost + Windows Firewall covers the gap if a
-            // future maintainer accidentally widens the prefix.
-            _listener.Prefixes.Add($"http://127.0.0.1:{Port}/");
+            // v3.2.7 hotfix: bind via the loopback hostname so the listener
+            // accepts BOTH ::1 (IPv6) and 127.0.0.1 (IPv4). Windows resolves
+            // `localhost` to both families; Chrome's Happy Eyeballs (RFC 6555)
+            // tries IPv6 first. Previously we bound only 127.0.0.1, which made
+            // the IPv6 attempt fail with connection-refused — and in some
+            // Chrome versions that surfaces as 503 to JS even though the IPv4
+            // fallback would succeed. Using `localhost` defers to the OS for
+            // both families.
+            //
+            // Loopback-only — spec § 安全边界: local API must NOT be reachable
+            // from the LAN. Windows Firewall covers the gap if a future
+            // maintainer accidentally widens the prefix.
+            _listener.Prefixes.Add($"http://localhost:{Port}/");
             _listener.Start();
             _running = true;
 
             _thread = new Thread(Loop) { IsBackground = true, Name = "BridgeHttpServer" };
             _thread.Start();
 
-            Log($"BridgeHttpServer started on http://127.0.0.1:{Port}/");
+            Log($"BridgeHttpServer started on http://localhost:{Port}/ (IPv4 + IPv6 loopback)");
         }
         catch (Exception ex)
         {
