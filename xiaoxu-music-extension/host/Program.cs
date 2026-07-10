@@ -97,7 +97,24 @@ while (true)
     var lengthBuffer = new byte[4];
     if (!FillBuffer(stdin, lengthBuffer, 4))
     {
-        break; // EOF — Chrome disconnected
+        // EOF — Chrome MV3 service worker was killed and closed the native
+        // messaging pipe. We used to `break;` here, which exited the host
+        // entirely (taking the BridgeHttpServer thread down with it). That
+        // made the dashboard's /state/current polling 503 for the entire
+        // 1-3s window between Chrome killing SW and respawning the host,
+        // and the user saw "song change didn't reflect".
+        //
+        // v3.2.8 fix: log it and back off briefly. The BridgeHttpServer
+        // thread keeps listening on http://localhost:17888/ regardless of
+        // stdin state, so the dashboard keeps working through MV3 SW restarts.
+        // When Chrome eventually reconnects via chrome.runtime.connectNative(),
+        // it's a brand-new host process; the OLD host's stale stdin is fine
+        // to ignore. The next time Chrome launches a host, it'll bind port
+        // 17889 (AudioDebugServer) fresh; the old 17888 stays up.
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss.fff}] stdin EOF — Chrome disconnected, sleeping 1000ms and keeping HttpListener alive (no break)\n");
+        Thread.Sleep(1000);
+        continue;
     }
 
     var messageLength = BinaryPrimitives.ReadUInt32LittleEndian(lengthBuffer);
