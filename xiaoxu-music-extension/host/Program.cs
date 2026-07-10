@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using xiaoxu_music_bridge.Bridge;
 using xiaoxu_music_bridge.Lyrics;
 using xiaoxu_music_bridge.Media;
 using xiaoxu_music_bridge.Audio;
@@ -42,6 +43,16 @@ var lyricService = new LocalLyricService(lyricsDir, sharedHttp);
 AudioBeatService? beatService = null;
 AudioDebugServer? debugServer = null;
 var stdoutLock = new object();
+
+// v3.2.4: HTTP server on http://127.0.0.1:17888/ for Lively Wallpaper + Chrome
+// without extension. Listens on loopback only (per spec § 安全边界). Shares the
+// same GSMTC + Win32 fallback pipeline as the Native Messaging handlers.
+var bridgeHttp = new BridgeHttpServer(gsmtcService, win32Fallback);
+bridgeHttp.SetLyricService(lyricService);
+bridgeHttp.SetCoverLookupServices(coverLookup, itunesCoverLookup);
+bridgeHttp.Start();
+LogPaths.SafeAppend(LogPaths.DebugLog,
+    $"[{DateTime.Now:HH:mm:ss}] BridgeHttpServer STARTED on http://127.0.0.1:17888/\n");
 
 // v3.2.2.1: Register GSMTC recovery probe. When the status breaker opens
 // (e.g., user seeked in QQ Music → CEF animation briefly deadlocked GSMTC),
@@ -137,7 +148,7 @@ while (true)
             "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, doc.RootElement),
             "getLyrics" => await HandleGetLyrics(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
             "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, itunesCoverLookup, GsmtcCircuitBreaker.ShouldSkipCover),
-            "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, stdout, stdoutLock),
+            "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, bridgeHttp, stdout, stdoutLock),
             "unsubscribeBeat" => HandleUnsubscribeBeat(ref beatService),
             "getBeat" => HandleGetBeat(beatService),
             "getGsmtcHealth" => HandleGetGsmtcHealth(),
@@ -174,6 +185,7 @@ while (true)
 // Cleanup
 beatService?.Dispose();
 debugServer?.Dispose();
+bridgeHttp.Dispose();
 
 static bool FillBuffer(Stream stream, byte[] buffer, int count)
 {
@@ -228,7 +240,21 @@ static async Task<(T Result, bool TimedOut)> WithTimeout<T>(Task<T> task, int ti
         });
         return (default!, true);
     }
-    return (await task, false);
+    // GSMTC throws synchronously (e.g. FileNotFoundException for a missing WinRT
+    // projection DLL — happens when single-file publish drops a transitive
+    // dependency). The original code rethrew here, which bypassed the Win32
+    // fallback in HandleGetStatus/HandleGetLyrics/HandleControl. Treat the
+    // synchronous fault the same as a timeout so the caller can fall back.
+    try
+    {
+        return (await task, false);
+    }
+    catch (Exception ex)
+    {
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] {opName} sync fault: {ex.GetType().Name}: {ex.Message}\n");
+        return (default!, true);
+    }
 }
 
 static async Task<string> HandleGetStatus(
@@ -584,7 +610,7 @@ static async Task<string> HandleGetCover(
     return tier3 ?? NoCover(viaFallback: true);
 }
 
-static string HandleSubscribeBeat(ref AudioBeatService? service, ref AudioDebugServer? debugServer, Stream stdout, object stdoutLock)
+static string HandleSubscribeBeat(ref AudioBeatService? service, ref AudioDebugServer? debugServer, BridgeHttpServer bridgeHttp, Stream stdout, object stdoutLock)
 {
     if (service is null)
     {
@@ -605,6 +631,11 @@ static string HandleSubscribeBeat(ref AudioBeatService? service, ref AudioDebugS
             LogPaths.SafeAppend(LogPaths.DebugLog,
                 $"[{DateTime.Now:HH:mm:ss}] AudioBeatService ATTACHED to AudioDebugServer\n");
         }
+
+        // v3.2.4: BridgeHttpServer's /beat/current endpoint needs the same
+        // beat service. Attach after first subscribe so the http server can
+        // answer beat polls from Lively / non-extension Chrome immediately.
+        bridgeHttp.SetBeatService(service);
 
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] AudioBeatService STARTED\n");

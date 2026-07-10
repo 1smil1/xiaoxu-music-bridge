@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
@@ -9,5 +9,45 @@
     <PublishSingleFile>true</PublishSingleFile>
     <UseWinRT>true</UseWinRT>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+  <!--
+    v3.2.3: System.Windows.Automation (AutomationElement, RangeValuePattern, ControlType)
+    for reading QQ Music's progress Slider via UI Automation. Reference the
+    UIA DLLs directly from the Microsoft.WindowsDesktop.App.Ref pack — the
+    smaller footprint vs. including the full FrameworkReference (which would
+    also pull in WPF native libs we never instantiate: PresentationNative,
+    wpfgfx, D3DCompiler, PenImc). Confirmed runtime-only includes
+    UIAutomationClient.dll + UIAutomationTypes.dll into the published exe.
+  -->
+  <PropertyGroup>
+    <!--
+      v3.2.3: Reference UIA DLLs from the *runtime* pack, not the ref pack.
+      The ref DLLs are abstractions (≈36 KB) used by the compiler; the runtime
+      DLLs (≈411 KB) contain the actual implementation. We also explicitly
+      bring in WindowsBase v9 from the WindowsDesktop runtime — UIAutomationClient
+      depends on WindowsBase 9.0.0.0 which is NOT part of NETCore.App.Ref's
+      WindowsBase 4.0.0.0. Without this, first call to AutomationElement.RootElement
+      throws FileNotFoundException("WindowsBase, Version=9.0.0.0, ...").
+    -->
+    <UiaRefDir>C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\9.0.17\</UiaRefDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="UIAutomationClient">
+      <HintPath>$(UiaRefDir)UIAutomationClient.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UIAutomationTypes">
+      <HintPath>$(UiaRefDir)UIAutomationTypes.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="WindowsBase">
+      <HintPath>$(UiaRefDir)WindowsBase.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
 
 </Project>
