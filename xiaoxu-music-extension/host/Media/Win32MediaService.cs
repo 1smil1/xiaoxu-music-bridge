@@ -73,14 +73,20 @@ public sealed class Win32MediaService : IMediaSessionService
         private readonly Thread _thread;
         public StaTaskScheduler(int concurrency, string name)
         {
+            // v3.2.5: TrySetApartmentState must be called BEFORE Start, not
+            // inside the thread body. The original v3.2.3 implementation set
+            // it inside the lambda, which silently failed (apartment was
+            // already locked at thread start) and left the thread as MTA —
+            // then AutomationElement.RootElement on first use threw
+            // FileNotFoundException for WindowsBase v9 missing AND COM
+            // apartment errors. Setting it before Start guarantees STA.
             _thread = new Thread(() =>
             {
-                // SetApartmentState must be called before Start.
-                _thread.TrySetApartmentState(ApartmentState.STA);
                 foreach (var t in _queue.GetConsumingEnumerable())
                     TryExecuteTask(t);
             })
             { Name = name, IsBackground = true };
+            _thread.TrySetApartmentState(ApartmentState.STA);
             _thread.Start();
         }
         protected override void QueueTask(Task task) => _queue.Add(task);
@@ -109,7 +115,15 @@ public sealed class Win32MediaService : IMediaSessionService
         bool isPlaying = false;
         if (pid > 0)
         {
-            // Run UIA on the dedicated STA scheduler — see _uiaScheduler comment.
+            // v3.2.5: Defensive — UIA can throw FileNotFoundException
+            // (WindowsBase v9 missing from single-file publish), TypeInitializationException
+            // (static cctor crash), or COMException (apartment wrong). ALL of these
+            // must NOT propagate up — the host's whole fallback chain dies if
+            // they do, and /state/current never returns. Catch broadly, log, and
+            // return the old behavior (isPlaying=false, position=0) so the
+            // dashboard's title/artist + beat-based isPlaying proxy still works.
+            // See GsmtcHealthTracker.IsPermanentlyBroken for the parallel fix on
+            // the GSMTC side.
             try
             {
                 var task = Task.Factory.StartNew(
@@ -127,9 +141,23 @@ public sealed class Win32MediaService : IMediaSessionService
                         $"[{DateTime.Now:HH:mm:ss}] [UIA] read timed out after 2s\n");
                 }
             }
-            catch (AggregateException ae) when (ae.InnerException != null)
+            catch (Exception ex)
             {
-                throw ae.InnerException;
+                // v3.2.5: was `catch (AggregateException ae) ... throw ae.InnerException;`
+                // which broke the entire status pipeline when UIA was fundamentally
+                // broken on the user's machine. Now: swallow + log + degrade to
+                // (false, 0, 0). Title/artist from the daemon window still works,
+                // so the dashboard still shows the song — just without live position.
+                var diag = new StringBuilder();
+                for (var e = ex; e != null; e = e.InnerException)
+                {
+                    diag.Append($" | {e.GetType().Name}: {e.Message}");
+                    if (e is System.IO.FileNotFoundException fnf && fnf.FileName != null)
+                        diag.Append($" [FileName={fnf.FileName}]");
+                }
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss}] [UIA] GetStatusAsync wrapper caught (degraded): {diag.ToString().TrimStart(' ', '|')}\n");
+                // isPlaying stays false, posMs/durMs stay 0 — see comment above
             }
         }
 

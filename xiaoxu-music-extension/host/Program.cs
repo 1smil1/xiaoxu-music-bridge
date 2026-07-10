@@ -225,7 +225,10 @@ static void WriteMessage(Stream stdout, string json, object? lockObj = null)
 // fallback and arrange for a late-completion log so we know whether GSMTC was
 // actually hung vs. just slow. The leaked Task is harmless — it eventually
 // completes or faults and is then GC'd.
-static async Task<(T Result, bool TimedOut)> WithTimeout<T>(Task<T> task, int timeoutMs, string opName)
+// v3.2.5: also returns the synchronous exception (if any) so callers can pass
+// it to GsmtcHealthTracker.RecordFailure and have it classified as a permanent
+// failure (FileNotFoundException → stop the restart loop).
+static async Task<(T Result, bool TimedOut, Exception? SyncFault)> WithTimeout<T>(Task<T> task, int timeoutMs, string opName)
 {
     var winner = await Task.WhenAny(task, Task.Delay(timeoutMs));
     if (winner != task)
@@ -238,7 +241,7 @@ static async Task<(T Result, bool TimedOut)> WithTimeout<T>(Task<T> task, int ti
             LogPaths.SafeAppend(LogPaths.DebugLog,
                 $"[{DateTime.Now:HH:mm:ss}] LATE {opName} {status}\n");
         });
-        return (default!, true);
+        return (default!, true, null);
     }
     // GSMTC throws synchronously (e.g. FileNotFoundException for a missing WinRT
     // projection DLL — happens when single-file publish drops a transitive
@@ -247,13 +250,13 @@ static async Task<(T Result, bool TimedOut)> WithTimeout<T>(Task<T> task, int ti
     // synchronous fault the same as a timeout so the caller can fall back.
     try
     {
-        return (await task, false);
+        return (await task, false, null);
     }
     catch (Exception ex)
     {
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] {opName} sync fault: {ex.GetType().Name}: {ex.Message}\n");
-        return (default!, true);
+        return (default!, true, ex);
     }
 }
 
@@ -266,7 +269,7 @@ static async Task<string> HandleGetStatus(
     if (!shouldSkipGsmtc())
     {
         var statusStopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var (status, timedOut) = await WithTimeout(
+        var (status, timedOut, syncFault) = await WithTimeout(
             gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync");
         statusStopwatch.Stop();
         if (!timedOut)
@@ -277,7 +280,7 @@ static async Task<string> HandleGetStatus(
             return SerializeStatus(status, viaFallback: false);
         }
         // Timed out — log failure and open the circuit breaker for 30s
-        GsmtcHealthTracker.RecordFailure("GetStatusAsync");
+        GsmtcHealthTracker.RecordFailure("GetStatusAsync", syncFault);
         GsmtcCircuitBreaker.Open();
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC TIMEOUT → falling back to Win32 daemon title\n");
@@ -342,7 +345,7 @@ static async Task<string> HandleControl(
 
     if (!shouldSkipGsmtc())
     {
-        var (result, timedOut) = await WithTimeout(
+        var (result, timedOut, syncFault) = await WithTimeout(
             gsmtc.SendCommandAsync(command, CancellationToken.None), 1500, "SendCommandAsync");
         if (!timedOut)
         {
@@ -355,7 +358,7 @@ static async Task<string> HandleControl(
                 viaFallback = false
             });
         }
-        GsmtcHealthTracker.RecordFailure("SendCommandAsync");
+        GsmtcHealthTracker.RecordFailure("SendCommandAsync", syncFault);
         GsmtcCircuitBreaker.Open();
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleControl GSMTC TIMEOUT control={commandStr} → media keys\n");
@@ -388,7 +391,7 @@ static async Task<string> HandleGetLyrics(
 
     if (!shouldSkipGsmtc())
     {
-        var (s, statusTimedOut) = await WithTimeout(
+        var (s, statusTimedOut, syncFault) = await WithTimeout(
             gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forLyrics)");
         if (!statusTimedOut)
         {
@@ -397,7 +400,7 @@ static async Task<string> HandleGetLyrics(
         }
         else
         {
-            GsmtcHealthTracker.RecordFailure("GetStatusAsync(forLyrics)");
+            GsmtcHealthTracker.RecordFailure("GetStatusAsync(forLyrics)", syncFault);
             GsmtcCircuitBreaker.Open();
             LogPaths.SafeAppend(LogPaths.DebugLog,
                 $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics GSMTC TIMEOUT → Win32 fallback\n");
@@ -416,7 +419,7 @@ static async Task<string> HandleGetLyrics(
     LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] Lyrics: title={status.Title}, artist={status.Artist}, viaFallback={viaFallback}\n");
 
-    var (lyrics, lyricsTimedOut) = await WithTimeout(
+    var (lyrics, lyricsTimedOut, _) = await WithTimeout(
         lyricService.GetCurrentLyricsAsync(status, CancellationToken.None), 5000, "GetCurrentLyricsAsync");
     if (lyricsTimedOut)
     {
@@ -474,7 +477,7 @@ static async Task<string> HandleGetCover(
     {
         if (string.IsNullOrWhiteSpace(title)) return null;
 
-        var (qqCover, qqTimedOut) = await WithTimeout(
+        var (qqCover, qqTimedOut, _) = await WithTimeout(
             coverLookup.GetCoverAsync(title, artist, CancellationToken.None), 5000, "QqMusicCoverLookup");
         if (qqTimedOut)
         {
@@ -496,7 +499,7 @@ static async Task<string> HandleGetCover(
     {
         if (string.IsNullOrWhiteSpace(title)) return null;
 
-        var (itCover, itTimedOut) = await WithTimeout(
+        var (itCover, itTimedOut, _) = await WithTimeout(
             itunesLookup.GetCoverAsync(title, artist, CancellationToken.None), 5000, "ITunesCoverLookup");
         if (itTimedOut)
         {
@@ -535,7 +538,7 @@ static async Task<string> HandleGetCover(
 
     if (!shouldSkipGsmtcCover())
     {
-        var (cover, timedOut) = await WithTimeout(
+        var (cover, timedOut, coverSyncFault) = await WithTimeout(
             gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GetCurrentCoverAsync");
         if (!timedOut)
         {
@@ -547,7 +550,10 @@ static async Task<string> HandleGetCover(
             }
 
             // GSMTC alive but no native cover. Read its metadata to decide the next source.
-            var (gsmtcStatus, statusTimedOut) = await WithTimeout(
+            // v3.2.5: ignore the sync fault from this internal call — we already
+            // validated GSMTC works for cover, and any fault here would already
+            // have been caught by the first WithTimeout above.
+            var (gsmtcStatus, statusTimedOut, _) = await WithTimeout(
                 gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forCover)");
 
             if (!statusTimedOut)
@@ -587,7 +593,7 @@ static async Task<string> HandleGetCover(
 
             return NoCover(viaFallback: false);
         }
-        GsmtcHealthTracker.RecordFailure("GetCurrentCoverAsync");
+        GsmtcHealthTracker.RecordFailure("GetCurrentCoverAsync", coverSyncFault);
         GsmtcCircuitBreaker.OpenCover();
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT → Win32 fallback + QQ/iTunes cover lookup\n");
@@ -677,6 +683,7 @@ static string HandleGetGsmtcHealth()
         totalRestarts = snap.TotalRestarts,
         lastSuccessAt = snap.LastSuccessAt?.ToString("o"),
         isStuck = snap.IsStuck,
+        isPermanentlyBroken = GsmtcHealthTracker.IsPermanentlyBroken,
         stuckThreshold = GsmtcHealthTracker.StuckThreshold,
     });
 }

@@ -10,6 +10,13 @@
 // Native Messaging handlers — same circuit breaker, same 1.5s timeout, same
 // cover tier chain. Lives on 127.0.0.1 only (spec § 安全边界).
 //
+// v3.2.5: BuildStateResponseAsync now runs cover + lyrics in parallel via
+// Task.WhenAll (was sequential: 5s cover + 5s lyrics = up to 15s total worst
+// case, which exceeded the dashboard's poll budget and timed out the curl
+// session). Both single-source timeouts reduced so the parallel worst case
+// is ≤ 5s. WithTimeout now returns the sync exception so callers can
+// classify permanent GSMTC failures.
+//
 // Endpoints (per spec):
 //   GET  /health              → { ok, name, version }
 //   GET  /status              → MediaStatus (spec § GET /status)
@@ -45,7 +52,7 @@ namespace xiaoxu_music_bridge.Bridge;
 public sealed class BridgeHttpServer : IDisposable
 {
     private const int Port = 17888;
-    private const string HostVersion = "3.2.4";
+    private const string HostVersion = "3.2.5";
 
     // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
     // user's machine during frontend iteration without modifying this list.
@@ -291,14 +298,14 @@ public sealed class BridgeHttpServer : IDisposable
     {
         if (!GsmtcCircuitBreaker.ShouldSkip())
         {
-            var (status, timedOut) = await WithTimeout(
+            var (status, timedOut, syncFault) = await WithTimeout(
                 _gsmtc.GetStatusAsync(CancellationToken.None), 1500, "HttpGetStatusAsync");
             if (!timedOut)
             {
                 GsmtcHealthTracker.RecordSuccess();
                 return (SerializeStatus(status, viaFallback: false), false);
             }
-            GsmtcHealthTracker.RecordFailure("HttpGetStatusAsync");
+            GsmtcHealthTracker.RecordFailure("HttpGetStatusAsync", syncFault);
             GsmtcCircuitBreaker.Open();
             Log("GSMTC timeout → Win32 fallback (HTTP)");
         }
@@ -324,8 +331,16 @@ public sealed class BridgeHttpServer : IDisposable
         string? artist = status.TryGetProperty("artist", out var aEl) && aEl.ValueKind == JsonValueKind.String
             ? aEl.GetString() : null;
 
-        var coverDataUrl = await ResolveCoverDataUrlAsync(title, artist, viaFallback);
-        var lyrics = await ResolveLyricsAsync(title, artist, viaFallback);
+        // v3.2.5: Run cover + lyrics in parallel — was sequential (up to 15s
+        // worst case: 5s cover + 5s lyrics + 5s iTunes + slack). Now both
+        // run concurrently so total wait is max(cover, lyrics) ≤ 5s, well
+        // within the dashboard's poll budget.
+        var coverTask = ResolveCoverDataUrlAsync(title, artist, viaFallback);
+        var lyricsTask = ResolveLyricsAsync(title, artist, viaFallback);
+        await Task.WhenAll(coverTask, lyricsTask);
+
+        var coverDataUrl = coverTask.Result;
+        var lyrics = lyricsTask.Result;
 
         // Signature = content hash. Frontend skips re-render when signature
         // matches the previous response. Excludes positionMs/isPlaying so a
@@ -361,18 +376,22 @@ public sealed class BridgeHttpServer : IDisposable
         ITunesCoverLookupService? itunes;
         lock (_coverLock) { qq = _qqCover; itunes = _itunesCover; }
 
+        // v3.2.5: Single-source timeouts reduced from 5s → 3s. Cover + lyrics
+        // now run in parallel (Task.WhenAll in BuildStateResponseAsync), so
+        // the /state/current total budget is max(cover, lyrics) ≈ 3s, well
+        // under the dashboard's poll deadline.
         // Mirror HandleGetCover tier 3/2b shape: try QQ then iTunes.
         if (qq != null)
         {
-            var (c, timedOut) = await WithTimeout(
-                qq.GetCoverAsync(title, artist, CancellationToken.None), 5000, "HttpQqCoverLookup");
+            var (c, timedOut, _) = await WithTimeout(
+                qq.GetCoverAsync(title, artist, CancellationToken.None), 3000, "HttpQqCoverLookup");
             if (timedOut) Log($"QQ cover lookup timed out for {title}");
             else if (c != null) cover = c;
         }
         if (cover == null && itunes != null)
         {
-            var (c, timedOut) = await WithTimeout(
-                itunes.GetCoverAsync(title, artist, CancellationToken.None), 5000, "HttpItunesCoverLookup");
+            var (c, timedOut, _) = await WithTimeout(
+                itunes.GetCoverAsync(title, artist, CancellationToken.None), 3000, "HttpItunesCoverLookup");
             if (timedOut) Log($"iTunes cover lookup timed out for {title}");
             else if (c != null) cover = c;
         }
@@ -412,14 +431,14 @@ public sealed class BridgeHttpServer : IDisposable
         CoverImage? cover = null;
         if (qq != null)
         {
-            var (c, _) = await WithTimeout(
-                qq.GetCoverAsync(title, artist, CancellationToken.None), 5000, "HttpQqCover");
+            var (c, _, _) = await WithTimeout(
+                qq.GetCoverAsync(title, artist, CancellationToken.None), 3000, "HttpQqCover");
             if (c != null) cover = c;
         }
         if (cover == null && itunes != null)
         {
-            var (c, _) = await WithTimeout(
-                itunes.GetCoverAsync(title, artist, CancellationToken.None), 5000, "HttpItunesCover");
+            var (c, _, _) = await WithTimeout(
+                itunes.GetCoverAsync(title, artist, CancellationToken.None), 3000, "HttpItunesCover");
             if (c != null) cover = c;
         }
 
@@ -460,8 +479,8 @@ public sealed class BridgeHttpServer : IDisposable
             IsPlaying: false, PositionMs: 0, DurationMs: 0,
             UpdatedAt: DateTimeOffset.Now);
 
-        var (lyrics, timedOut) = await WithTimeout(
-            svc.GetCurrentLyricsAsync(status, CancellationToken.None), 5000, "HttpGetLyrics");
+        var (lyrics, timedOut, _) = await WithTimeout(
+            svc.GetCurrentLyricsAsync(status, CancellationToken.None), 4000, "HttpGetLyrics");
         if (timedOut)
         {
             Log("Lyrics lookup timed out");
@@ -506,14 +525,14 @@ public sealed class BridgeHttpServer : IDisposable
 
         if (!GsmtcCircuitBreaker.ShouldSkip())
         {
-            var (result, timedOut) = await WithTimeout(
+            var (result, timedOut, syncFault) = await WithTimeout(
                 _gsmtc.SendCommandAsync(cmd, CancellationToken.None), 1500, "HttpSendCommand");
             if (!timedOut)
             {
                 GsmtcHealthTracker.RecordSuccess();
                 return (result.Ok, result.Error, false);
             }
-            GsmtcHealthTracker.RecordFailure("HttpSendCommand");
+            GsmtcHealthTracker.RecordFailure("HttpSendCommand", syncFault);
             GsmtcCircuitBreaker.Open();
         }
 
@@ -557,22 +576,24 @@ public sealed class BridgeHttpServer : IDisposable
         return sb.ToString();
     }
 
-    private static async Task<(T result, bool timedOut)> WithTimeout<T>(Task<T> task, int ms, string opName)
+    private static async Task<(T result, bool timedOut, Exception? syncFault)> WithTimeout<T>(Task<T> task, int ms, string opName)
     {
         var winner = await Task.WhenAny(task, Task.Delay(ms));
-        if (winner != task) return (default!, true);
+        if (winner != task) return (default!, true, null);
         // See Program.cs WithTimeout for rationale: GSMTC throws synchronously
         // (FileNotFoundException on missing WinRT projection DLL). Treat as
         // timeout so the caller can fall back to Win32 instead of bubbling a
         // 500 up to Lively/Chrome.
+        // v3.2.5: also return the sync exception so callers can classify it
+        // as a permanent failure (FileNotFoundException → stop the restart loop).
         try
         {
-            return (await task, false);
+            return (await task, false, null);
         }
         catch (Exception ex)
         {
             Log($"{opName} sync fault: {ex.GetType().Name}: {ex.Message}");
-            return (default!, true);
+            return (default!, true, ex);
         }
     }
 

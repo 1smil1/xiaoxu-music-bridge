@@ -19,6 +19,13 @@ namespace xiaoxu_music_bridge.Common;
 /// Without this, a QQ Music seek would deadlock GSMTC briefly → breaker opens
 /// → status shows viaFallback=true → positionMs=0 → lyric frozen for up to
 /// 30s waiting for the natural reset.
+///
+/// v3.2.5: Permanent skip. When GsmtcHealthTracker detects a non-recoverable
+/// GSMTC failure (missing WinRT projection DLL, type init crash), it sets a
+/// persistently-saved flag. ShouldSkip() and ShouldSkipCover() now check that
+/// flag first and return true forever — so the host never tries GSMTC again
+/// after a permanent breakage, stopping the death-loop where the host
+/// restarts every 2s and kills /state/current mid-response.
 /// </summary>
 public static class GsmtcCircuitBreaker
 {
@@ -36,11 +43,23 @@ public static class GsmtcCircuitBreaker
         TriggerProbe();
     }
     public static void Close() => _skipUntil = DateTime.MinValue;
-    public static bool ShouldSkip() => DateTime.Now < _skipUntil;
+    public static bool ShouldSkip()
+    {
+        // v3.2.5: permanent broken flag wins over the 30s timer. Once GSMTC
+        // is permanently broken, it stays skipped forever (until the user
+        // manually runs reset-bridge.bat to clear the flag).
+        if (GsmtcHealthTracker.IsPermanentlyBroken) return true;
+        return DateTime.Now < _skipUntil;
+    }
 
     // Cover-only breaker (independent)
     public static void OpenCover() => _coverSkipUntil = DateTime.Now + OpenDuration;
-    public static bool ShouldSkipCover() => DateTime.Now < _coverSkipUntil;
+    public static bool ShouldSkipCover()
+    {
+        // v3.2.5: same permanent-broken check for the cover path.
+        if (GsmtcHealthTracker.IsPermanentlyBroken) return true;
+        return DateTime.Now < _coverSkipUntil;
+    }
 
     /// <summary>
     /// Register a probe function. It must return true when GSMTC is healthy
