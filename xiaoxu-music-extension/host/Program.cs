@@ -43,6 +43,29 @@ AudioBeatService? beatService = null;
 AudioDebugServer? debugServer = null;
 var stdoutLock = new object();
 
+// v3.2.2.1: Register GSMTC recovery probe. When the status breaker opens
+// (e.g., user seeked in QQ Music → CEF animation briefly deadlocked GSMTC),
+// this probe runs in the background every 3s and closes the breaker the
+// moment GSMTC recovers — so the next /state/current poll gets a real
+// positionMs and lyric catches up to the seek target within ~3-5s.
+GsmtcCircuitBreaker.RegisterProbe(
+    async () =>
+    {
+        try
+        {
+            var task = gsmtcService.GetStatusAsync(CancellationToken.None);
+            var winner = await Task.WhenAny(task, Task.Delay(1500));
+            if (winner != task) return false;
+            await task;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    },
+    msg => LogPaths.SafeAppend(LogPaths.DebugLog, msg));
+
 // Start the debug HTTP server immediately so Claude can curl it before the
 // user opens the wallpaper page. It will return "waiting" responses until
 // AudioBeatService is attached (which happens on first subscribeBeat).
