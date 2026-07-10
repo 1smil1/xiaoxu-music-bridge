@@ -342,58 +342,66 @@ public sealed class BridgeHttpServer : IDisposable
         string? artist = status.TryGetProperty("artist", out var aEl) && aEl.ValueKind == JsonValueKind.String
             ? aEl.GetString() : null;
 
-        // v3.2.7 (Track C2): Fire-and-forget cover + lyrics. /state/current
-        // returns CACHED cover/lyrics (or null on first request) immediately
-        // and kicks off a background task to refresh them. The poll loop runs
-        // at ~1Hz and previously blocked the worker thread for up to 5s while
-        // cover + lyrics fetched — that's why song-switch UI felt laggy.
+        // v3.2.7 hotfix (Track C2): Lyrics are awaited INLINE so the
+        // dashboard sees them on the FIRST poll after a song change. The
+        // previous fire-and-forget version showed "暂无歌词" for 1-3 seconds
+        // because the response was sent before the background fetch
+        // completed. Lyric queries are lightweight (~1.5s HTTP GET) so
+        // adding them back to the critical path is acceptable.
         //
-        // First request: response has cover=null, lyrics=null. Background
-        // task kicks off and populates the cache. Second request (within
-        // ~1s) gets the cached values.
-        //
-        // On song change: cache key changes, first poll for the new song
-        // returns empty + starts fetching in background.
+        // Cover (50-200KB image bytes) stays fire-and-forget — image
+        // downloads are what made /state/current feel laggy in v3.2.6.
         var cacheKey = $"{title}|{artist}|{viaFallback}";
+
+        // Lyrics: cached lookup first (fast path for repeat polls).
+        _lyricCacheLock.EnterReadLock();
+        bool haveLyrics = _lyricCache.TryGetValue(cacheKey, out var lyrics);
+        _lyricCacheLock.ExitReadLock();
+        if (!haveLyrics)
+        {
+            // Cache miss — fetch inline so the first poll returns real lyrics.
+            try
+            {
+                lyrics = await ResolveLyricsAsync(title, artist, viaFallback);
+                _lyricCacheLock.EnterWriteLock();
+                _lyricCache[cacheKey] = lyrics;
+                _lyricCacheLock.ExitWriteLock();
+                Log($"lyrics fetched inline: found={lyrics?.Found} source={lyrics?.Source} title='{title}'");
+            }
+            catch (Exception ex)
+            {
+                Log($"inline lyrics fetch failed: {ex.GetType().Name}: {ex.Message}");
+                lyrics = null;
+            }
+        }
+
+        // Cover: cached lookup first (fast path).
         _coverCacheLock.EnterReadLock();
         bool haveCover = _coverCache.TryGetValue(cacheKey, out var coverDataUrl);
         _coverCacheLock.ExitReadLock();
         if (!haveCover) coverDataUrl = null;
 
-        _lyricCacheLock.EnterReadLock();
-        bool haveLyrics = _lyricCache.TryGetValue(cacheKey, out var lyrics);
-        _lyricCacheLock.ExitReadLock();
-        if (!haveLyrics) lyrics = null;
-
-        // Kick off background refresh if cache miss OR song changed since
-        // last background fetch.
-        bool needBackgroundFetch = !haveCover || !haveLyrics;
+        // Cover background fetch — only kick once per cache key (no thrash).
+        bool needCoverFetch = !haveCover || cacheKey != _lastBackgroundFetchKey;
         if (cacheKey != _lastBackgroundFetchKey)
         {
             _lastBackgroundFetchKey = cacheKey;
-            needBackgroundFetch = true;
         }
 
-        if (needBackgroundFetch && !string.IsNullOrWhiteSpace(title))
+        if (needCoverFetch && !string.IsNullOrWhiteSpace(title))
         {
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    var (newCover, newLyrics) = await FetchCoverAndLyricsAsync(title, artist, viaFallback);
-                    if (newCover != null || _coverCache.ContainsKey(cacheKey))
-                    {
-                        _coverCacheLock.EnterWriteLock();
-                        _coverCache[cacheKey] = newCover;
-                        _coverCacheLock.ExitWriteLock();
-                    }
-                    _lyricCacheLock.EnterWriteLock();
-                    _lyricCache[cacheKey] = newLyrics;
-                    _lyricCacheLock.ExitWriteLock();
+                    var newCover = await ResolveCoverDataUrlAsync(title, artist, viaFallback);
+                    _coverCacheLock.EnterWriteLock();
+                    _coverCache[cacheKey] = newCover;
+                    _coverCacheLock.ExitWriteLock();
                 }
                 catch (Exception ex)
                 {
-                    Log($"background cover/lyrics fetch failed: {ex.GetType().Name}: {ex.Message}");
+                    Log($"background cover fetch failed: {ex.GetType().Name}: {ex.Message}");
                 }
             });
         }
@@ -664,9 +672,21 @@ public sealed class BridgeHttpServer : IDisposable
         }
     }
 
+    // v3.2.7 hotfix: camelCase naming so the frontend (which expects lowercase
+    // keys like `found`, `lrc`, `fileName`) can read LyricResponse fields back.
+    // Without this, the record's PascalCase properties (Found/Lrc/FileName) come
+    // through as-is, every LyricResponse field is undefined on the dashboard, and
+    // the lyric column shows "暂无歌词" even though /state/current actually carries
+    // the full LRC body. All other responses are already anonymous objects with
+    // lowercase keys, so this policy only changes the LyricResponse record shape.
+    private static readonly JsonSerializerOptions HttpJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
+
     private static void WriteJson(HttpListenerContext ctx, int status, object body)
     {
-        var json = JsonSerializer.Serialize(body);
+        var json = JsonSerializer.Serialize(body, HttpJsonOptions);
         var bytes = Encoding.UTF8.GetBytes(json);
         ctx.Response.StatusCode = status;
         ctx.Response.ContentType = "application/json; charset=utf-8";
