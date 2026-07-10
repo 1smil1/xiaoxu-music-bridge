@@ -15,39 +15,24 @@
   </ItemGroup>
 
   <!--
-    v3.2.3: System.Windows.Automation (AutomationElement, RangeValuePattern, ControlType)
-    for reading QQ Music's progress Slider via UI Automation. Reference the
-    UIA DLLs directly from the Microsoft.WindowsDesktop.App.Ref pack — the
-    smaller footprint vs. including the full FrameworkReference (which would
-    also pull in WPF native libs we never instantiate: PresentationNative,
-    wpfgfx, D3DCompiler, PenImc). Confirmed runtime-only includes
-    UIAutomationClient.dll + UIAutomationTypes.dll into the published exe.
+    v3.2.6: Switch from explicit <Reference HintPath> to FrameworkReference.
+    The v3.2.3 approach bundled only the managed UIA DLLs (UIAutomationClient.dll,
+    UIAutomationTypes.dll, WindowsBase.dll) into the single-file exe — but those
+    DLLs also reference WPF native helpers (Native.dll, PresentationNative_cor3.dll)
+    at runtime. Those native helpers live in the Microsoft.WindowsDesktop.App
+    runtime pack and were dropped by self-contained single-file publish without
+    a FrameworkReference. Symptom: every getStatus call logged
+    `EXCEPTION: type=FileNotFoundException` from inside AutomationElement.RootElement.
+
+    Fix: declare the framework reference so the publish step copies the runtime
+    pack's native DLLs alongside the exe (or into the bundle). Trade: exe grows
+    from ~157MB to ~210MB because the whole WPF/WinForms runtime ships.
+    We never instantiate WPF/WinForms types — the footprint is purely transitive
+    WindowsBase dependency. Worth paying to make UIA actually work so lyric
+    sync has a real position source instead of relying on the virtual clock.
   -->
-  <PropertyGroup>
-    <!--
-      v3.2.3: Reference UIA DLLs from the *runtime* pack, not the ref pack.
-      The ref DLLs are abstractions (≈36 KB) used by the compiler; the runtime
-      DLLs (≈411 KB) contain the actual implementation. We also explicitly
-      bring in WindowsBase v9 from the WindowsDesktop runtime — UIAutomationClient
-      depends on WindowsBase 9.0.0.0 which is NOT part of NETCore.App.Ref's
-      WindowsBase 4.0.0.0. Without this, first call to AutomationElement.RootElement
-      throws FileNotFoundException("WindowsBase, Version=9.0.0.0, ...").
-    -->
-    <UiaRefDir>C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\9.0.17\</UiaRefDir>
-  </PropertyGroup>
   <ItemGroup>
-    <Reference Include="UIAutomationClient">
-      <HintPath>$(UiaRefDir)UIAutomationClient.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
-    <Reference Include="UIAutomationTypes">
-      <HintPath>$(UiaRefDir)UIAutomationTypes.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
-    <Reference Include="WindowsBase">
-      <HintPath>$(UiaRefDir)WindowsBase.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
   </ItemGroup>
 
 </Project>
