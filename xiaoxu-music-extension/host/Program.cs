@@ -148,7 +148,7 @@ while (true)
             "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, doc.RootElement),
             "getLyrics" => await HandleGetLyrics(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
             "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, itunesCoverLookup, GsmtcCircuitBreaker.ShouldSkipCover),
-            "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, bridgeHttp, stdout, stdoutLock),
+            "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, bridgeHttp, win32Fallback, stdout, stdoutLock),
             "unsubscribeBeat" => HandleUnsubscribeBeat(ref beatService),
             "getBeat" => HandleGetBeat(beatService),
             "getGsmtcHealth" => HandleGetGsmtcHealth(),
@@ -616,7 +616,7 @@ static async Task<string> HandleGetCover(
     return tier3 ?? NoCover(viaFallback: true);
 }
 
-static string HandleSubscribeBeat(ref AudioBeatService? service, ref AudioDebugServer? debugServer, BridgeHttpServer bridgeHttp, Stream stdout, object stdoutLock)
+static string HandleSubscribeBeat(ref AudioBeatService? service, ref AudioDebugServer? debugServer, BridgeHttpServer bridgeHttp, Win32MediaService win32Fallback, Stream stdout, object stdoutLock)
 {
     if (service is null)
     {
@@ -642,6 +642,11 @@ static string HandleSubscribeBeat(ref AudioBeatService? service, ref AudioDebugS
         // beat service. Attach after first subscribe so the http server can
         // answer beat polls from Lively / non-extension Chrome immediately.
         bridgeHttp.SetBeatService(service);
+
+        // v3.2.7 (Track B): Wire the beat service into the Win32 fallback so
+        // its virtual clock has a StateDetector-backed isPlaying signal.
+        // Without this, the clock would default to optimistic "playing" forever.
+        win32Fallback.AttachBeatService(service);
 
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] AudioBeatService STARTED\n");

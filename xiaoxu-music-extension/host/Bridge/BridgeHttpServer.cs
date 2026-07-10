@@ -80,13 +80,24 @@ public sealed class BridgeHttpServer : IDisposable
     private readonly object _beatLock = new();
     private AudioBeatService? _beatService;
 
-    // Track cover cache to avoid hammering QQ/iTunes on every /state/current poll.
-    // Keyed by (title, artist, content-type); value is base64 data URL or null
-    // (negative cache). Cache is per-process; survives across requests.
+    // v3.2.7: per-song cover + lyric caches backing the fire-and-forget
+    // /state/current path. The previous single-slot cache only stored the
+    // most recent track's data — now we keep one slot per (title, artist)
+    // key so song switches don't have to re-fetch the previous song's
+    // cover/lyrics synchronously.
+    //
+    // ReaderWriterLockSlim protects concurrent access from many poll
+    // requests. Cache is per-process; survives across requests.
     private readonly Dictionary<string, string?> _coverCache = new();
-    private readonly object _coverCacheLock = new();
+    private readonly ReaderWriterLockSlim _coverCacheLock = new();
+    private readonly Dictionary<string, LyricResponse?> _lyricCache = new();
+    private readonly ReaderWriterLockSlim _lyricCacheLock = new();
+    private string _lastBackgroundFetchKey = ""; // dedupes background fetches
+
+    /// <summary>Legacy single-slot cover cache — kept only for direct lookups in /cover/current.</summary>
     private string _coverCacheKey = "";
     private string? _coverCacheValue;
+    private readonly object _coverCacheLegacyLock = new();
 
     private HttpListener? _listener;
     private Thread? _thread;
@@ -331,20 +342,62 @@ public sealed class BridgeHttpServer : IDisposable
         string? artist = status.TryGetProperty("artist", out var aEl) && aEl.ValueKind == JsonValueKind.String
             ? aEl.GetString() : null;
 
-        // v3.2.5: Run cover + lyrics in parallel — was sequential (up to 15s
-        // worst case: 5s cover + 5s lyrics + 5s iTunes + slack). Now both
-        // run concurrently so total wait is max(cover, lyrics) ≤ 5s, well
-        // within the dashboard's poll budget.
-        var coverTask = ResolveCoverDataUrlAsync(title, artist, viaFallback);
-        var lyricsTask = ResolveLyricsAsync(title, artist, viaFallback);
-        await Task.WhenAll(coverTask, lyricsTask);
+        // v3.2.7 (Track C2): Fire-and-forget cover + lyrics. /state/current
+        // returns CACHED cover/lyrics (or null on first request) immediately
+        // and kicks off a background task to refresh them. The poll loop runs
+        // at ~1Hz and previously blocked the worker thread for up to 5s while
+        // cover + lyrics fetched — that's why song-switch UI felt laggy.
+        //
+        // First request: response has cover=null, lyrics=null. Background
+        // task kicks off and populates the cache. Second request (within
+        // ~1s) gets the cached values.
+        //
+        // On song change: cache key changes, first poll for the new song
+        // returns empty + starts fetching in background.
+        var cacheKey = $"{title}|{artist}|{viaFallback}";
+        _coverCacheLock.EnterReadLock();
+        bool haveCover = _coverCache.TryGetValue(cacheKey, out var coverDataUrl);
+        _coverCacheLock.ExitReadLock();
+        if (!haveCover) coverDataUrl = null;
 
-        var coverDataUrl = coverTask.Result;
-        var lyrics = lyricsTask.Result;
+        _lyricCacheLock.EnterReadLock();
+        bool haveLyrics = _lyricCache.TryGetValue(cacheKey, out var lyrics);
+        _lyricCacheLock.ExitReadLock();
+        if (!haveLyrics) lyrics = null;
 
-        // Signature = content hash. Frontend skips re-render when signature
-        // matches the previous response. Excludes positionMs/isPlaying so a
-        // seek/pause re-renders even if everything else is identical.
+        // Kick off background refresh if cache miss OR song changed since
+        // last background fetch.
+        bool needBackgroundFetch = !haveCover || !haveLyrics;
+        if (cacheKey != _lastBackgroundFetchKey)
+        {
+            _lastBackgroundFetchKey = cacheKey;
+            needBackgroundFetch = true;
+        }
+
+        if (needBackgroundFetch && !string.IsNullOrWhiteSpace(title))
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var (newCover, newLyrics) = await FetchCoverAndLyricsAsync(title, artist, viaFallback);
+                    if (newCover != null || _coverCache.ContainsKey(cacheKey))
+                    {
+                        _coverCacheLock.EnterWriteLock();
+                        _coverCache[cacheKey] = newCover;
+                        _coverCacheLock.ExitWriteLock();
+                    }
+                    _lyricCacheLock.EnterWriteLock();
+                    _lyricCache[cacheKey] = newLyrics;
+                    _lyricCacheLock.ExitWriteLock();
+                }
+                catch (Exception ex)
+                {
+                    Log($"background cover/lyrics fetch failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            });
+        }
+
         string sig = ComputeSignature(title, artist, coverDataUrl, lyrics?.Lrc);
 
         return new
@@ -353,8 +406,22 @@ public sealed class BridgeHttpServer : IDisposable
             coverDataUrl,
             lyrics,
             signature = sig,
-            cached = false,
+            cached = haveCover || haveLyrics,
         };
+    }
+
+    /// <summary>
+    /// v3.2.7 background-fetch variant. Mirrors what the previous in-line
+    /// BuildStateResponseAsync did (cover + lyrics in parallel) but runs
+    /// off the response critical path.
+    /// </summary>
+    private async Task<(string? cover, LyricResponse? lyrics)> FetchCoverAndLyricsAsync(
+        string? title, string? artist, bool viaFallback)
+    {
+        var coverTask = ResolveCoverDataUrlAsync(title, artist, viaFallback);
+        var lyricsTask = ResolveLyricsAsync(title, artist, viaFallback);
+        await Task.WhenAll(coverTask, lyricsTask);
+        return (coverTask.Result, lyricsTask.Result);
     }
 
     // --- Cover -------------------------------------------------------------

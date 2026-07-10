@@ -347,6 +347,25 @@ public sealed class AudioBeatService : IDisposable
     }
 
     /// <summary>
+    /// v3.2.7: Expose the StateDetector's isPlaying snapshot for callers
+    /// (Win32MediaService virtual clock) that need a playing/paused signal
+    /// derived from system audio levels. Returns (isPlaying, volume) —
+    /// isPlaying is false until the StateDetector has had at least one
+    /// frame of input. Volume is the RMS-derived level (0..1).
+    /// </summary>
+    public (bool isPlaying, float volume) GetIsPlayingAndVolume()
+    {
+        lock (_snapshotLock)
+        {
+            var f = _latestFeatures;
+            var s = _stateDetector?.State;
+            float volume = MathF.Min(1f, f.Rms * 4f);
+            bool isPlaying = s?.IsPlaying ?? false;
+            return (isPlaying, volume);
+        }
+    }
+
+    /// <summary>
     /// Returns a JSON snapshot with all v3 fields for HTTP /state/current endpoint.
     /// </summary>
     public string GetFullSnapshotJson()

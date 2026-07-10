@@ -402,6 +402,20 @@ internal static class SelfRestart
     /// <param name="level">1 = plain restart; 2 = + audiosrv cycle; 3 = + audiodg.exe kill.</param>
     public static void Run(int level)
     {
+        // v3.2.7: if GSMTC has been flagged permanently broken, the host must
+        // NOT self-restart — every restart creates a ~10-15s downtime + audio
+        // device re-initialization window during which /state/current returns
+        // null and the dashboard's lyric sync breaks. The user has to run
+        // restart-audio.bat manually to recover (or reset-bridge.bat if they
+        // reinstall the missing WinRT DLL).
+        if (GsmtcHealthTracker.IsPermanentlyBroken)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss.fff}] ESCALATION: GSMTC PERMANENTLY BROKEN — " +
+                $"suppressing self-restart at level {level}. User must run restart-audio.bat manually.\n");
+            return;
+        }
+
         try
         {
             switch (level)
@@ -438,6 +452,17 @@ internal static class SelfRestart
     /// </summary>
     public static void SpawnReplacementAndExit(bool skipEscalation)
     {
+        // v3.2.7: belt-and-braces guard. Track C1 also blocks Run() above,
+        // but this direct call site (from RecordFailure's stuck-on-exit path)
+        // needs the same protection.
+        if (GsmtcHealthTracker.IsPermanentlyBroken)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss.fff}] SpawnReplacementAndExit suppressed: GSMTC PERMANENTLY BROKEN. " +
+                $"Drain and stay alive.\n");
+            return;
+        }
+
         try
         {
             string? exePath = Environment.ProcessPath;
