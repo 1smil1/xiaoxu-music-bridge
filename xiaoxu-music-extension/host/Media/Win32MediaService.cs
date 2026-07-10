@@ -1,27 +1,33 @@
-// Win32MediaService — fallback media service that reads QQ Music metadata
-// directly from its hidden Daemon window title (instead of via GSMTC broker).
+// Win32MediaService — fallback media service that reads QQ Music metadata.
 //
-// Why: GSMTC broker deadlocks freeze GlobalSystemMediaTransportControlsSessionManager
-//      .RequestAsync() indefinitely. This service bypasses the broker entirely:
-//      it uses Win32 GetWindowText() on QQMusic_Daemon_Wnd, whose title is formatted
-//      as "歌名 - 歌手" whenever a track is loaded.
+// v3.2.7: position source swapped from UIA → QQMusicComApiService.
+//   - GSMTC (v3.2.5) permanently broken on this machine (WinRT projection DLL missing).
+//   - UIA (v3.2.6) doesn't expose a Slider/ProgressBar in QQ Music's CEF tree.
+//   - New: csQQMusicComApiWnd2017 hidden COM API window accepts WM_COPYDATA with
+//     `player/playerstatus` action and replies via registered window message
+//     carrying real position / duration / isPlaying / title / artist.
 //
-// What we can extract (v3.2.3):
-//   Title         ✅  from window title (before " - ")
-//   Artist        ✅  from window title (after " - ")
-//   Source        ✅  "QQMusic" derived from process name
-//   isPlaying     ✅  inferred by UIA: poll the QQ Music progress-slider twice and
-//                   check whether Value changed (≥50 ms ⇒ playing)
-//   Position      ✅  UIA RangeValuePattern.Current.Value − Minimum  (ms)
-//   Duration      ✅  UIA RangeValuePattern.Current.Maximum − Minimum (ms)
+//   Title/artist ALSO still come from the daemon window ("歌名 - 歌手" pattern)
+//   as a fallback — COM API may return nulls on some QQ Music versions and the
+//   daemon window has been the reliable source since v3.2.0.
+//
+//   UIA code is retained as a tertiary fallback for QQ Music versions that
+//   expose a Slider — it does no harm to keep the path live.
+//
+// What we can extract (v3.2.7):
+//   Title         ✅  from COM API, fallback to daemon window title (before " - ")
+//   Artist        ✅  from COM API, fallback to daemon window title (after " - ")
+//   Source        ✅  "QQMusic" derived from process name / COM API source
+//   isPlaying     ✅  from COM API state code; UIA delta as fallback
+//   Position      ✅  from COM API playtime; UIA RangeValue as fallback
+//   Duration      ✅  from COM API totaltime; UIA RangeValue as fallback
 //   Album         ❌  not in title — left null
 //   Cover         ❌  CEF renders offscreen; PrintWindow path is brittle — covered
 //                   via QqMusicCoverLookupService (third tier)
 //
 // GSMTC remains the primary path; this is only used after a GSMTC timeout.
-// UIA failures (e.g. QQ Music upgrades the slider's control type) fall back
-// gracefully — we return isPlaying=false, position=0, duration=0 and log
-// `[UIA] read failed: ...` so the dashboard still works in degraded mode.
+// COM API failures fall back gracefully to UIA; UIA failures degrade to
+// (isPlaying=false, position=0) and the dashboard still works.
 
 using System;
 using System.Collections.Concurrent;
@@ -36,7 +42,7 @@ using xiaoxu_music_bridge.Common;
 
 namespace xiaoxu_music_bridge.Media;
 
-public sealed class Win32MediaService : IMediaSessionService
+public sealed class Win32MediaService : IMediaSessionService, IDisposable
 {
     private const string QQMusicProcessName = "QQMusic";
     private const string DaemonWindowClass = "QQMusic_Daemon_Wnd";
@@ -45,6 +51,10 @@ public sealed class Win32MediaService : IMediaSessionService
     private const byte VkMediaPreviousTrack = 0xB1;
     private const byte VkMediaPlayPause = 0xB3;
     private const byte KeyEventKeyUp = 0x0002;
+
+    // v3.2.7: Primary position source for the fallback path. STA thread +
+    // WM_COPYDATA client that talks to QQ Music's hidden `csQQMusicComApiWnd2017`.
+    private readonly QQMusicComApiService _comApi = new();
 
     // UIA state — held between calls so isPlaying can be inferred by delta.
     // volatile because GetStatusAsync is called from many Native Messaging threads.
@@ -96,68 +106,93 @@ public sealed class Win32MediaService : IMediaSessionService
 
     public Task<MediaStatus> GetStatusAsync(CancellationToken cancellationToken)
     {
-        var (title, artist) = ReadQqMusicTitleAndArtist();
-        if (title == null && artist == null)
+        var (daemonTitle, daemonArtist) = ReadQqMusicTitleAndArtist();
+        if (daemonTitle == null && daemonArtist == null)
         {
             // No QQ Music track loaded — reset UIA state so the next track's
             // first poll doesn't think the song is paused.
             lock (_uiaLock) { _lastUiaValue = double.NaN; _lastUiaIsPlaying = false; }
             return Task.FromResult(MediaStatus.NoMedia());
         }
-        bool hasTrack = !string.IsNullOrWhiteSpace(title);
+        bool hasTrack = !string.IsNullOrWhiteSpace(daemonTitle);
 
-        // v3.2.3: UIA read for position / isPlaying / duration.
-        // Title/artist still come from the daemon window because QQ Music's
-        // UIA tree exposes "Title" only as the window title (same source).
-        var procs = Process.GetProcessesByName(QQMusicProcessName);
-        int pid = procs.Length > 0 ? procs[0].Id : 0;
+        // v3.2.7: Try COM API first (real position via WM_COPYDATA). If the
+        // window can't be found or the request times out, fall back to UIA.
+        // Either way, title/artist come from the daemon window as the most
+        // reliable source across QQ Music versions (the COM API may omit them
+        // on some versions — see `player/playerstatus` schema variance).
         long posMs = 0, durMs = 0;
         bool isPlaying = false;
-        if (pid > 0)
+        string? title = daemonTitle;
+        string? artist = daemonArtist;
+
+        try
         {
-            // v3.2.5: Defensive — UIA can throw FileNotFoundException
-            // (WindowsBase v9 missing from single-file publish), TypeInitializationException
-            // (static cctor crash), or COMException (apartment wrong). ALL of these
-            // must NOT propagate up — the host's whole fallback chain dies if
-            // they do, and /state/current never returns. Catch broadly, log, and
-            // return the old behavior (isPlaying=false, position=0) so the
-            // dashboard's title/artist + beat-based isPlaying proxy still works.
-            // See GsmtcHealthTracker.IsPermanentlyBroken for the parallel fix on
-            // the GSMTC side.
-            try
+            // Synchronous wait — the COM API task has its own 1s timeout inside,
+            // so this is bounded even if the STA pump is stuck.
+            var comTask = _comApi.GetPlayerStatusAsync(CancellationToken.None);
+            if (comTask.Wait(1500) && comTask.Result is { } comStatus)
             {
-                var task = Task.Factory.StartNew(
-                    () => ReadPositionViaUIA(pid),
-                    CancellationToken.None,
-                    TaskCreationOptions.None,
-                    _uiaScheduler);
-                if (task.Wait(2000))
+                if (comStatus.PositionMs > 0) posMs = comStatus.PositionMs;
+                if (comStatus.DurationMs > 0) durMs = comStatus.DurationMs;
+                // Trust COM API's isPlaying only if we got real values
+                if (comStatus.PositionMs > 0 || comStatus.DurationMs > 0)
                 {
-                    (isPlaying, posMs, durMs) = task.Result;
+                    isPlaying = comStatus.IsPlaying;
                 }
-                else
-                {
-                    LogPaths.SafeAppend(LogPaths.DebugLog,
-                        $"[{DateTime.Now:HH:mm:ss}] [UIA] read timed out after 2s\n");
-                }
-            }
-            catch (Exception ex)
-            {
-                // v3.2.5: was `catch (AggregateException ae) ... throw ae.InnerException;`
-                // which broke the entire status pipeline when UIA was fundamentally
-                // broken on the user's machine. Now: swallow + log + degrade to
-                // (false, 0, 0). Title/artist from the daemon window still works,
-                // so the dashboard still shows the song — just without live position.
-                var diag = new StringBuilder();
-                for (var e = ex; e != null; e = e.InnerException)
-                {
-                    diag.Append($" | {e.GetType().Name}: {e.Message}");
-                    if (e is System.IO.FileNotFoundException fnf && fnf.FileName != null)
-                        diag.Append($" [FileName={fnf.FileName}]");
-                }
+                // Prefer COM API's title/artist when present (more accurate
+                // e.g. for unicode normalization). Fall back to daemon window.
+                if (!string.IsNullOrWhiteSpace(comStatus.Title)) title = comStatus.Title;
+                if (!string.IsNullOrWhiteSpace(comStatus.Artist)) artist = comStatus.Artist;
                 LogPaths.SafeAppend(LogPaths.DebugLog,
-                    $"[{DateTime.Now:HH:mm:ss}] [UIA] GetStatusAsync wrapper caught (degraded): {diag.ToString().TrimStart(' ', '|')}\n");
-                // isPlaying stays false, posMs/durMs stay 0 — see comment above
+                    $"[{DateTime.Now:HH:mm:ss}] [ComApi] pos={posMs}ms dur={durMs}ms playing={isPlaying} title='{title}' artist='{artist}'\n");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] [ComApi] GetPlayerStatusAsync wrapper caught (degraded): {ex.GetType().Name}: {ex.Message}\n");
+        }
+
+        // Fallback: UIA — if COM API gave us nothing (window not found / parse
+        // failed / timeout) and we have a QQ Music PID, try reading the
+        // slider. v3.2.5 left this defensive (catch broadly so a broken UIA
+        // stack can't kill the whole fallback chain).
+        if (posMs == 0 && durMs == 0)
+        {
+            var procs = Process.GetProcessesByName(QQMusicProcessName);
+            int pid = procs.Length > 0 ? procs[0].Id : 0;
+            if (pid > 0)
+            {
+                try
+                {
+                    var task = Task.Factory.StartNew(
+                        () => ReadPositionViaUIA(pid),
+                        CancellationToken.None,
+                        TaskCreationOptions.None,
+                        _uiaScheduler);
+                    if (task.Wait(2000))
+                    {
+                        (isPlaying, posMs, durMs) = task.Result;
+                    }
+                    else
+                    {
+                        LogPaths.SafeAppend(LogPaths.DebugLog,
+                            $"[{DateTime.Now:HH:mm:ss}] [UIA] read timed out after 2s\n");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    var diag = new StringBuilder();
+                    for (var e = ex; e != null; e = e.InnerException)
+                    {
+                        diag.Append($" | {e.GetType().Name}: {e.Message}");
+                        if (e is System.IO.FileNotFoundException fnf && fnf.FileName != null)
+                            diag.Append($" [FileName={fnf.FileName}]");
+                    }
+                    LogPaths.SafeAppend(LogPaths.DebugLog,
+                        $"[{DateTime.Now:HH:mm:ss}] [UIA] GetStatusAsync wrapper caught (degraded): {diag.ToString().TrimStart(' ', '|')}\n");
+                }
             }
         }
 
@@ -336,4 +371,13 @@ public sealed class Win32MediaService : IMediaSessionService
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     [DllImport("user32.dll")] private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    // v3.2.7: tear down the COM API STA thread + reply window when the host
+    // shuts down. Program.cs doesn't currently call Dispose on Win32MediaService,
+    // but if it ever does (e.g. for tests or graceful shutdown hooks) this
+    // makes it safe.
+    public void Dispose()
+    {
+        try { _comApi.Dispose(); } catch { /* swallow */ }
+    }
 }
