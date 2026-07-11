@@ -98,11 +98,16 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
     private DateTime _clockLastTickAt;
     private int _clockConsecutivePausedTicks;
     private int _clockConsecutivePlayingTicks;
+    private readonly object _fastPlaybackLock = new();
+    private string _fastPlaybackKey = "";
+    private bool _fastPlaybackAssumedPlaying = true;
+    private DateTime? _fastPlaybackPauseCandidateSince;
 
     // Limits: anchor resets when the same anchor is trusted for too many polls.
     // Without this, a paused-but-heard-a-spike could "drift" past 0 again.
     private const int ConsecutivePlayingRequired = 1; // 1 poll of "playing" advances
-    private const int ConsecutivePausedRequired = 2;   // 2 polls of "paused" freeze (debounce)
+    private const int ConsecutivePausedRequired = 1;
+    private static readonly TimeSpan FastPauseConfirmDelay = TimeSpan.FromMilliseconds(100);
 
     // Track A1b: Window-scan throttling — v3.2.7 attempts ~60 (action × payload × class)
     // combos that take ~3s end-to-end. We don't want to eat that on every 1Hz poll.
@@ -138,13 +143,12 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
         }
 
         var key = $"{daemonTitle}|{daemonArtist}";
-        // Fast status is the dashboard's lyric clock source. QQ Music's audio
-        // energy proxy can drop to false during quiet passages or capture jitter,
-        // which freezes lyrics even though the track is still playing. Until we
-        // have a real QQ play/pause signal, keep the lyric clock optimistic while
-        // a track is present.
-        var posMs = VirtualClockTick(key, beatIsPlaying: true);
-        var isPlaying = true;
+        // Fast status is the dashboard's lyric clock source. The audio-energy
+        // proxy can momentarily drop during quiet passages/capture jitter, so
+        // require a sustained quiet window before treating QQ Music as paused.
+        var rawBeatPlaying = DetectIsPlayingFromBeat();
+        var isPlaying = SmoothFastPlaybackState(key, rawBeatPlaying);
+        var posMs = VirtualClockTick(key, isPlaying);
         var hasTrack = !string.IsNullOrWhiteSpace(daemonTitle);
         var durMs = hasTrack
             ? await TryLyricFileDuration(daemonTitle!, daemonArtist, 0, cancellationToken)
@@ -412,6 +416,35 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
             return isPlaying;
         }
         catch { return true; }
+    }
+
+    private bool SmoothFastPlaybackState(string songKey, bool rawBeatPlaying)
+    {
+        lock (_fastPlaybackLock)
+        {
+            var now = DateTime.UtcNow;
+            if (_fastPlaybackKey != songKey)
+            {
+                _fastPlaybackKey = songKey;
+                _fastPlaybackAssumedPlaying = true;
+                _fastPlaybackPauseCandidateSince = null;
+            }
+
+            if (rawBeatPlaying)
+            {
+                _fastPlaybackAssumedPlaying = true;
+                _fastPlaybackPauseCandidateSince = null;
+                return true;
+            }
+
+            _fastPlaybackPauseCandidateSince ??= now;
+            if (now - _fastPlaybackPauseCandidateSince.Value >= FastPauseConfirmDelay)
+            {
+                _fastPlaybackAssumedPlaying = false;
+            }
+
+            return _fastPlaybackAssumedPlaying;
+        }
     }
 
     private long _lyricFileDurationCacheKey = 0;
