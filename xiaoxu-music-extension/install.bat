@@ -79,6 +79,23 @@ reg add "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve
 echo  [4/5] OK (HKCU + HKLM)
 echo.
 
+echo  [4b/5] Syncing Chrome User Data JSON ...
+rem Some older installs left a stale JSON in Chrome User Data NativeMessagingHosts
+rem directory with the WRONG extension ID. Chrome does not always re-read HKCU on
+rem hot-update, so we ALSO overwrite the User Data JSON to make sure both lookup
+rem paths return the correct ID. Idempotent - safe to run repeatedly.
+set "USERDATA_JSON=%LOCALAPPDATA%\Google\Chrome\User Data\NativeMessagingHosts\xiaoxu_music_host.json"
+if not exist "%LOCALAPPDATA%\Google\Chrome\User Data\NativeMessagingHosts" (
+    mkdir "%LOCALAPPDATA%\Google\Chrome\User Data\NativeMessagingHosts" >nul 2>&1
+)
+copy /Y "%INSTALL_DIR%\xiaoxu_music_host.json" "%USERDATA_JSON%" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo  [4b/5] FAILED - could not write User Data JSON
+) else (
+    echo  [4b/5] OK - %USERDATA_JSON%
+)
+echo.
+
 echo  [5/5] Closing Chrome ...
 taskkill /F /IM chrome.exe >nul 2>&1
 timeout /t 2 /nobreak >nul

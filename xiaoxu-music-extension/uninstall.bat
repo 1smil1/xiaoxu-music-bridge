@@ -31,6 +31,16 @@ reg delete "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" 
 reg delete "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /f >nul 2>&1
 echo  [OK] 注册表已清除 (HKCU + HKLM)
 
+:: Delete stale JSON in Chrome User Data NativeMessagingHosts directory
+:: (mirrors what install.bat copies in; old installs leave a file behind
+:: pointing at a dead extension ID and Chrome silently refuses to spawn
+:: the host until it is removed)
+set "USERDATA_JSON=%LOCALAPPDATA%\Google\Chrome\User Data\NativeMessagingHosts\xiaoxu_music_host.json"
+if exist "%USERDATA_JSON%" (
+    del /f /q "%USERDATA_JSON%" >nul 2>&1
+    echo  [OK] Chrome User Data JSON 已清除
+)
+
 :: Delete all files in current directory (except uninstall.bat itself)
 set "INSTALL_DIR=%~dp0"
 del /f /q "%INSTALL_DIR%\xiaoxu-music-host.exe" >nul 2>&1

@@ -98,6 +98,24 @@ if (Test-Path "HKLM:\Software\Google\Chrome") {
 
 Write-Host "  -> OK" -ForegroundColor Green
 
+
+# Sync JSON to Chrome User Data NativeMessagingHosts directory.
+# Some older installs left a stale JSON there with the WRONG extension ID;
+# Chrome does not always re-read HKCU on hot-update, so we ALSO overwrite
+# the User Data JSON to make sure both lookup paths return the correct ID.
+# Idempotent - safe to run repeatedly.
+$userDataDir = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+$userDataNmDir = Join-Path $userDataDir "NativeMessagingHosts"
+if (!(Test-Path $userDataNmDir)) {
+    New-Item -ItemType Directory -Path $userDataNmDir -Force | Out-Null
+}
+$userDataJson = Join-Path $userDataNmDir "xiaoxu_music_host.json"
+try {
+    Copy-Item -Path $manifestPath -Destination $userDataJson -Force
+    Write-Host "  -> Synced to Chrome User Data JSON" -ForegroundColor Green
+} catch {
+    Write-Host "  -> WARN: Could not sync to Chrome User Data JSON: $_" -ForegroundColor Yellow
+}
 # ── 5. Copy Chrome extension ──────────────────────────────────────
 Write-Host "[4/5] Copying Chrome extension..." -ForegroundColor Yellow
 
