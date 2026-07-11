@@ -304,6 +304,28 @@ static async Task<string> HandleGetStatus(
         if (!timedOut)
         {
             GsmtcHealthTracker.RecordSuccess();
+            // v3.2.9: GSMTC returned successfully within 1.5s but with no
+            // title/artist — strongly indicates GSMTC failed to enumerate QQ
+            // Music's session (QQ Music uses CEF, doesn't register a GSMTC
+            // session). Without this probe the dashboard sits on "GSMTC" with
+            // empty title / 未连接播放器 while QQ Music's daemon window IS
+            // visible to Win32. Try Win32 before returning the empty GSMTC
+            // status — if Win32 found a track via QQMusic_Daemon_Wnd title,
+            // return that instead.
+            if (string.IsNullOrEmpty(status.Title) && string.IsNullOrEmpty(status.Artist))
+            {
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC NoMedia (no session) -> probing Win32\n");
+                var probeStatus = await fallback.GetStatusAsync(CancellationToken.None);
+                if (!string.IsNullOrEmpty(probeStatus.Title) || !string.IsNullOrEmpty(probeStatus.Artist))
+                {
+                    LogPaths.SafeAppend(LogPaths.DebugLog,
+                        $"[{DateTime.Now:HH:mm:ss}] Status (Win32 probe-recovered): title={probeStatus.Title}, artist={probeStatus.Artist}\n");
+                    return SerializeStatus(probeStatus, viaFallback: true);
+                }
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC NoMedia + Win32 also empty -> returning GSMTC NoMedia\n");
+            }
             LogPaths.SafeAppend(LogPaths.DebugLog,
                 $"[{DateTime.Now:HH:mm:ss}] Status (GSMTC): title={status.Title}, artist={status.Artist}, pos={status.PositionMs}, dur={status.DurationMs}, dt={statusStopwatch.ElapsedMilliseconds}ms\n");
             return SerializeStatus(status, viaFallback: false);
