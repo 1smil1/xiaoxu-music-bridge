@@ -170,7 +170,7 @@ async function handleBridgeRequest(port, fetchId, message) {
   }
 
   if (pathname === '/health') {
-    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.2.12' } });
+    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.2.16' } });
     return;
   }
 
@@ -201,23 +201,11 @@ async function handleBridgeRequest(port, fetchId, message) {
     let coverDataUrl = null;
     const coverKey = [statusObj.source, statusObj.title, statusObj.artist, statusObj.album]
       .map((x) => (x == null ? '' : String(x))).join('|');
-    // QQ Music's native GSMTC thumbnail is usually null (CEF doesn't expose it to
-    // Windows.Media), but our HandleGetCover Tier 2 will try the QQ Music search API
-    // when source=QQMusic. So call getCover for QQ Music regardless of hasCover.
-    if (statusResp.hasCover || statusResp.source === 'QQMusic') {
-      if (stateCoverKey === coverKey) {
-        coverDataUrl = stateCoverDataUrl;
-      } else {
-        try {
-          const cover = await sendToHost({ type: 'getCover' });
-          if (cover && cover.data) {
-            coverDataUrl = `data:${cover.contentType};base64,${cover.data}`;
-          }
-          stateCoverKey = coverKey;
-          stateCoverDataUrl = coverDataUrl;
-          chrome.storage.session.set({ coverDataUrl, stateCoverKey: coverKey });
-        } catch (e) { /* keep cached */ }
-      }
+    // Do not synchronously call getCover from /state/current. Native Messaging is
+    // FIFO; a slow cover lookup blocks the next getState and makes lyric changes
+    // appear ~10s late. Keep the already-cached cover for the same song only.
+    if (stateCoverKey === coverKey) {
+      coverDataUrl = stateCoverDataUrl;
     } else {
       stateCoverKey = coverKey;
       stateCoverDataUrl = null;
