@@ -106,8 +106,8 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
     // Limits: anchor resets when the same anchor is trusted for too many polls.
     // Without this, a paused-but-heard-a-spike could "drift" past 0 again.
     private const int ConsecutivePlayingRequired = 1; // 1 poll of "playing" advances
-    private const int ConsecutivePausedRequired = 1;
-    private static readonly TimeSpan FastPauseConfirmDelay = TimeSpan.FromMilliseconds(100);
+    private const int ConsecutivePausedRequired = 2;
+    private static readonly TimeSpan FastPauseConfirmDelay = TimeSpan.FromMilliseconds(750);
 
     // Track A1b: Window-scan throttling — v3.2.7 attempts ~60 (action × payload × class)
     // combos that take ~3s end-to-end. We don't want to eat that on every 1Hz poll.
