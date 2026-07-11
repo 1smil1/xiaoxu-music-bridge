@@ -127,6 +127,44 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
 
     public void AttachBeatService(AudioBeatService? svc) => _beat = svc;
 
+    public async Task<MediaStatus> GetFastStatusAsync(CancellationToken cancellationToken)
+    {
+        var (daemonTitle, daemonArtist) = ReadQqMusicTitleAndArtist();
+        if (daemonTitle == null && daemonArtist == null)
+        {
+            lock (_uiaLock) { _lastUiaValue = double.NaN; _lastUiaIsPlaying = false; }
+            ResetClock("no-track");
+            return MediaStatus.NoMedia();
+        }
+
+        var key = $"{daemonTitle}|{daemonArtist}";
+        // Fast status is the dashboard's lyric clock source. QQ Music's audio
+        // energy proxy can drop to false during quiet passages or capture jitter,
+        // which freezes lyrics even though the track is still playing. Until we
+        // have a real QQ play/pause signal, keep the lyric clock optimistic while
+        // a track is present.
+        var posMs = VirtualClockTick(key, beatIsPlaying: true);
+        var isPlaying = true;
+        var hasTrack = !string.IsNullOrWhiteSpace(daemonTitle);
+        var durMs = hasTrack
+            ? await TryLyricFileDuration(daemonTitle!, daemonArtist, 0, cancellationToken)
+            : 0;
+
+        EmitTrackChangedIfNeeded(daemonTitle, daemonArtist, hasTrack);
+
+        return new MediaStatus(
+            Connected: true,
+            Source: "QQMusic",
+            Title: daemonTitle,
+            Artist: daemonArtist,
+            Album: null,
+            CoverUrl: null,
+            IsPlaying: isPlaying,
+            PositionMs: posMs,
+            DurationMs: durMs,
+            UpdatedAt: DateTimeOffset.Now);
+    }
+
     public async Task<MediaStatus> GetStatusAsync(CancellationToken cancellationToken)
     {
         var (daemonTitle, daemonArtist) = ReadQqMusicTitleAndArtist();
@@ -212,19 +250,7 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
         // spurious prefetch fetches. Subscribers (BridgeHttpServer) MUST be
         // non-blocking — they run on this thread otherwise the COM API /
         // window scan would stall while a 1-3s lyric lookup is in flight.
-        var normTitle = title?.Trim();
-        var normArtist = artist?.Trim();
-        if (hasTrack && (normTitle != _lastEmittedTitle || normArtist != _lastEmittedArtist))
-        {
-            _lastEmittedTitle = normTitle;
-            _lastEmittedArtist = normArtist;
-            try { TrackChanged?.Invoke(this, EventArgs.Empty); }
-            catch (Exception ex)
-            {
-                LogPaths.SafeAppend(LogPaths.DebugLog,
-                    $"[{DateTime.Now:HH:mm:ss}] [Win32] TrackChanged subscriber threw: {ex.GetType().Name}: {ex.Message}\n");
-            }
-        }
+        EmitTrackChangedIfNeeded(title, artist, hasTrack);
 
         return new MediaStatus(
             Connected: true,
@@ -237,6 +263,22 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
             PositionMs: posMs,
             DurationMs: durMs,
             UpdatedAt: DateTimeOffset.Now);
+    }
+
+    private void EmitTrackChangedIfNeeded(string? title, string? artist, bool hasTrack)
+    {
+        var normTitle = title?.Trim();
+        var normArtist = artist?.Trim();
+        if (!hasTrack || (normTitle == _lastEmittedTitle && normArtist == _lastEmittedArtist)) return;
+
+        _lastEmittedTitle = normTitle;
+        _lastEmittedArtist = normArtist;
+        try { TrackChanged?.Invoke(this, EventArgs.Empty); }
+        catch (Exception ex)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] [Win32] TrackChanged subscriber threw: {ex.GetType().Name}: {ex.Message}\n");
+        }
     }
 
     private void ApplyRealStatus(

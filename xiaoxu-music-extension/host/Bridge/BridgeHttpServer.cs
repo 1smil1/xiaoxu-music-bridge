@@ -52,7 +52,7 @@ namespace xiaoxu_music_bridge.Bridge;
 public sealed class BridgeHttpServer : IDisposable
 {
     private const int Port = 17888;
-    private const string HostVersion = "3.2.10";
+    private const string HostVersion = "3.2.14";
 
     // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
     // user's machine during frontend iteration without modifying this list.
@@ -90,8 +90,9 @@ public sealed class BridgeHttpServer : IDisposable
     // requests. Cache is per-process; survives across requests.
     private readonly Dictionary<string, string?> _coverCache = new();
     private readonly ReaderWriterLockSlim _coverCacheLock = new();
-    private readonly Dictionary<string, LyricResponse?> _lyricCache = new();
-    private readonly ReaderWriterLockSlim _lyricCacheLock = new();
+    // v3.2.10 hotfix: lyric cache moved to Common.LyricPrefetchCache (static)
+    // so the Native Messaging path (Program.cs HandleGetLyrics) and the HTTP
+    // path (this server) share the same dictionary.
     private string _lastBackgroundFetchKey = ""; // dedupes background fetches
 
     /// <summary>Legacy single-slot cover cache — kept only for direct lookups in /cover/current.</summary>
@@ -110,14 +111,13 @@ public sealed class BridgeHttpServer : IDisposable
         _gsmtc = gsmtc;
         _win32Fallback = win32Fallback;
 
-        // v3.2.10: subscribe to song-change events from Win32MediaService.
-        // The handler fire-and-forget prefetches lyrics so the next
-        // /state/current poll (4Hz) returns the new song's lyrics from cache
-        // instead of paying the 1-3s QQ Music API round-trip inline. This
-        // collapses the lyric-switch latency from 1-3s freeze on the
-        // previous song's last line to a 0ms cache hit on the first poll
-        // after the song change.
-        _win32Fallback.TrackChanged += OnWin32TrackChanged;
+        // v3.2.10 hotfix: lyric prefetch subscription moved to Program.cs
+        // (top-level statement) so it benefits the Native Messaging path
+        // too. The original v3.2.10 prefetch here only helped the HTTP
+        // path; the dashboard extension's injected.js intercepts fetch to
+        // 127.0.0.1:17888 and reroutes through Program.cs HandleGetLyrics,
+        // bypassing this server's cache entirely. Both paths now share
+        // Common.LyricPrefetchCache.
     }
 
     /// <summary>
@@ -187,89 +187,14 @@ public sealed class BridgeHttpServer : IDisposable
 
     public void Dispose()
     {
-        try { _win32Fallback.TrackChanged -= OnWin32TrackChanged; } catch { }
         Stop();
     }
 
-    // --- v3.2.10: TrackChanged prefetch ------------------------------------
-
-    /// <summary>
-    /// v3.2.10: when Win32MediaService detects a (title, artist) transition,
-    /// prefetch the lyrics in the background so the next /state/current poll
-    /// returns from cache (0ms). Locks the song by snapshotting title/artist
-    /// before the lookup; if the user has switched again by the time the
-    /// lookup returns (1-3s window), discard the prefetch. This is the
-    /// user's chosen race-resolution strategy — see plan v3.2.10 § A2.
-    /// </summary>
-    private void OnWin32TrackChanged(object? sender, EventArgs e)
-    {
-        // Fire-and-forget. The handler MUST NOT block the COM API / window
-        // scan thread that raised the event, or the dashboard's next
-        // /state/current poll would stall on a slow lyric lookup.
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var status = await _win32Fallback.GetStatusAsync(CancellationToken.None);
-                if (status == null || string.IsNullOrWhiteSpace(status.Title)) return;
-
-                var lookupTitle = status.Title.Trim();
-                var lookupArtist = status.Artist?.Trim();
-
-                LocalLyricService? svc;
-                lock (_lyricLock) svc = _lyricService;
-                if (svc == null)
-                {
-                    Log("TrackChanged prefetch skipped: lyric service not attached yet");
-                    return;
-                }
-
-                var lyrics = await ResolveLyricsAsync(lookupTitle, lookupArtist, viaFallback: true);
-                if (lyrics == null || !lyrics.Found)
-                {
-                    Log($"TrackChanged prefetch: no lyrics for '{lookupTitle}' — not caching");
-                    return;
-                }
-
-                // Re-check after the await — discard stale prefetch if the
-                // user has already switched to another song.
-                var now = await _win32Fallback.GetStatusAsync(CancellationToken.None);
-                var nowTitle = now?.Title?.Trim();
-                var nowArtist = now?.Artist?.Trim();
-                if (nowTitle != lookupTitle || nowArtist != lookupArtist)
-                {
-                    Log($"TrackChanged prefetch discarded (status changed): expected='{lookupTitle}' got='{nowTitle}'");
-                    return;
-                }
-
-                // Prime both viaFallback keys so the next poll hits cache
-                // regardless of which side of the GSMTC circuit breaker the
-                // dashboard is on.
-                PrimeLyricCache(lookupTitle, lookupArtist, viaFallback: false, lyrics);
-                PrimeLyricCache(lookupTitle, lookupArtist, viaFallback: true, lyrics);
-                Log($"TrackChanged prefetch → stored (title='{lookupTitle}', artist='{lookupArtist}', lrcLen={lyrics.Lrc?.Length ?? 0})");
-            }
-            catch (Exception ex)
-            {
-                Log($"TrackChanged prefetch failed: {ex.GetType().Name}: {ex.Message}");
-            }
-        });
-    }
-
-    /// <summary>
-    /// Write a lyric lookup result directly into the cache for the given
-    /// (title, artist, viaFallback) key. Used by the TrackChanged prefetch
-    /// path so the next /state/current poll returns it inline (0ms).
-    /// Mirrors the cache key shape used in BuildStateResponseAsync:
-    /// "{title}|{artist}|{viaFallback}".
-    /// </summary>
-    public void PrimeLyricCache(string title, string? artist, bool viaFallback, LyricResponse lyrics)
-    {
-        var key = $"{title}|{artist}|{viaFallback}";
-        _lyricCacheLock.EnterWriteLock();
-        try { _lyricCache[key] = lyrics; }
-        finally { _lyricCacheLock.ExitWriteLock(); }
-    }
+    // --- v3.2.10 hotfix: TrackChanged prefetch -----------------------------
+    //
+    // Subscription moved to Program.cs so the Native Messaging path
+    // (HandleGetLyrics, used by extension's injected.js-routed fetches)
+    // benefits too. Both paths share Common.LyricPrefetchCache.
 
     // --- Main loop ---------------------------------------------------------
 
@@ -403,8 +328,8 @@ public sealed class BridgeHttpServer : IDisposable
     // --- Status / state ----------------------------------------------------
 
     /// <summary>
-    /// Mirrors Program.cs HandleGetStatus: try GSMTC with 1.5s timeout, fall
-    /// back to Win32MediaService on circuit-breaker open or timeout. Returns
+    /// Mirrors Program.cs HandleGetState: try GSMTC with 1.5s timeout, fall
+    /// back to the fast Win32 path on circuit-breaker open or timeout. Returns
     /// the full MediaStatus JSON shape plus a viaFallback flag.
     /// </summary>
     private async Task<(object json, bool viaFallback)> BuildStatusJsonAsync()
@@ -424,10 +349,10 @@ public sealed class BridgeHttpServer : IDisposable
         }
         else
         {
-            Log("GSMTC skipped (breaker open) → Win32 fallback (HTTP)");
+            Log("GSMTC skipped (breaker open) → Win32 fast fallback (HTTP)");
         }
 
-        var fb = await _win32Fallback.GetStatusAsync(CancellationToken.None);
+        var fb = await _win32Fallback.GetFastStatusAsync(CancellationToken.None);
         return (SerializeStatus(fb, viaFallback: true), true);
     }
 
@@ -451,23 +376,29 @@ public sealed class BridgeHttpServer : IDisposable
         // completed. Lyric queries are lightweight (~1.5s HTTP GET) so
         // adding them back to the critical path is acceptable.
         //
+        // v3.2.10 hotfix: lyrics are checked against Common.LyricPrefetchCache
+        // first. The prefetch subscription (in Program.cs) fires on song
+        // change and writes here, so the first poll after the switch hits
+        // 0ms instead of paying the 1-3s QQ Music API round-trip inline.
+        //
         // Cover (50-200KB image bytes) stays fire-and-forget — image
         // downloads are what made /state/current feel laggy in v3.2.6.
-        var cacheKey = $"{title}|{artist}|{viaFallback}";
+        var coverCacheKey = $"{title}|{artist}|{viaFallback}";
 
-        // Lyrics: cached lookup first (fast path for repeat polls).
-        _lyricCacheLock.EnterReadLock();
-        bool haveLyrics = _lyricCache.TryGetValue(cacheKey, out var lyrics);
-        _lyricCacheLock.ExitReadLock();
+        // Lyrics: shared cache first (Program.cs writes here on song change).
+        LyricResponse? lyrics;
+        bool haveLyrics = LyricPrefetchCache.TryGet(title, artist, out lyrics)
+                          && lyrics != null && lyrics.Found;
         if (!haveLyrics)
         {
             // Cache miss — fetch inline so the first poll returns real lyrics.
             try
             {
                 lyrics = await ResolveLyricsAsync(title, artist, viaFallback);
-                _lyricCacheLock.EnterWriteLock();
-                _lyricCache[cacheKey] = lyrics;
-                _lyricCacheLock.ExitWriteLock();
+                if (lyrics != null && lyrics.Found)
+                {
+                    LyricPrefetchCache.Store(title, artist, lyrics);
+                }
                 Log($"lyrics fetched inline: found={lyrics?.Found} source={lyrics?.Source} title='{title}'");
             }
             catch (Exception ex)
@@ -479,16 +410,15 @@ public sealed class BridgeHttpServer : IDisposable
 
         // Cover: cached lookup first (fast path).
         _coverCacheLock.EnterReadLock();
-        bool haveCover = _coverCache.TryGetValue(cacheKey, out var coverDataUrl);
+        bool haveCover = _coverCache.TryGetValue(coverCacheKey, out var coverDataUrl);
         _coverCacheLock.ExitReadLock();
         if (!haveCover) coverDataUrl = null;
 
-        // Cover background fetch — only kick once per cache key (no thrash).
-        bool needCoverFetch = !haveCover || cacheKey != _lastBackgroundFetchKey;
-        if (cacheKey != _lastBackgroundFetchKey)
-        {
-            _lastBackgroundFetchKey = cacheKey;
-        }
+        // Cover background fetch — only kick once per cache key while a
+        // lookup is in flight. Polls can arrive faster than the image lookup
+        // completes, so do not start duplicate QQ/iTunes downloads.
+        bool needCoverFetch = !haveCover && coverCacheKey != _lastBackgroundFetchKey;
+        if (needCoverFetch) _lastBackgroundFetchKey = coverCacheKey;
 
         if (needCoverFetch && !string.IsNullOrWhiteSpace(title))
         {
@@ -498,11 +428,12 @@ public sealed class BridgeHttpServer : IDisposable
                 {
                     var newCover = await ResolveCoverDataUrlAsync(title, artist, viaFallback);
                     _coverCacheLock.EnterWriteLock();
-                    _coverCache[cacheKey] = newCover;
+                    _coverCache[coverCacheKey] = newCover;
                     _coverCacheLock.ExitWriteLock();
                 }
                 catch (Exception ex)
                 {
+                    if (_lastBackgroundFetchKey == coverCacheKey) _lastBackgroundFetchKey = "";
                     Log($"background cover fetch failed: {ex.GetType().Name}: {ex.Message}");
                 }
             });

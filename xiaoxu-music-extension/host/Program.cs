@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -37,6 +38,68 @@ var sharedHttp = new HttpClient();
 var coverLookup = new QqMusicCoverLookupService(sharedHttp);
 var itunesCoverLookup = new ITunesCoverLookupService(sharedHttp);
 var lyricService = new LocalLyricService(lyricsDir, sharedHttp);
+
+// v3.2.10 hotfix: subscribe to Win32MediaService.TrackChanged at the top
+// level so the Native Messaging path (Program.cs HandleGetLyrics) also
+// benefits from lyric prefetch. The original prefetch in BridgeHttpServer
+// only helped the HTTP path; the extension's injected.js intercepts fetch
+// to 127.0.0.1:17888 and reroutes through this Native Messaging handler,
+// which never touched BridgeHttpServer's cache. Now both paths share
+// LyricPrefetchCache (Common/LyricPrefetchCache.cs).
+win32Fallback.TrackChanged += (sender, e) =>
+{
+    _ = System.Threading.Tasks.Task.Run(async () =>
+    {
+        try
+        {
+            var status = await win32Fallback.GetFastStatusAsync(System.Threading.CancellationToken.None);
+            if (status == null || string.IsNullOrWhiteSpace(status.Title)) return;
+
+            var lookupTitle = status.Title.Trim();
+            var lookupArtist = status.Artist?.Trim();
+
+            // Skip if a previous prefetch already populated this key (e.g.
+            // BridgeHttpServer's subscriber wrote it first — order doesn't
+            // matter because we just want at-least-once delivery).
+            if (LyricPrefetchCache.TryGet(lookupTitle, lookupArtist, out var existing) && existing?.Found == true)
+            {
+                return;
+            }
+
+            var mediaStatus = new xiaoxu_music_bridge.Media.MediaStatus(
+                Connected: true, Source: "Prefetch",
+                Title: lookupTitle, Artist: lookupArtist, Album: null, CoverUrl: null,
+                IsPlaying: false, PositionMs: 0, DurationMs: 0,
+                UpdatedAt: DateTimeOffset.Now);
+
+            var (lyrics, timedOut, _) = await WithTimeout(
+                lyricService.GetCurrentLyricsAsync(mediaStatus, System.Threading.CancellationToken.None),
+                5000, "TrackChangedPrefetch");
+
+            // Re-check after the await — discard stale prefetch if the
+            // user has already switched to another song.
+            var now = await win32Fallback.GetFastStatusAsync(System.Threading.CancellationToken.None);
+            if (now?.Title?.Trim() != lookupTitle || now?.Artist?.Trim() != lookupArtist)
+            {
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss}] [TrackChangedPrefetch] discarded (status changed): expected='{lookupTitle}' got='{now?.Title}'\n");
+                return;
+            }
+
+            if (!timedOut && lyrics != null && lyrics.Found)
+            {
+                LyricPrefetchCache.Store(lookupTitle, lookupArtist, lyrics);
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss}] [TrackChangedPrefetch] → stored (title='{lookupTitle}', artist='{lookupArtist}', lrcLen={lyrics.Lrc?.Length ?? 0})\n");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] [TrackChangedPrefetch] failed: {ex.GetType().Name}: {ex.Message}\n");
+        }
+    });
+};
 
 // Audio beat service - captures system audio and computes bass/volume/pulse
 // Started on first subscribeBeat command, stopped on unsubscribeBeat
@@ -162,6 +225,7 @@ while (true)
         responseJson = type switch
         {
             "getStatus" => await HandleGetStatus(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip),
+            "getState" => await HandleGetState(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
             "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, doc.RootElement),
             "getLyrics" => await HandleGetLyrics(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
             "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, itunesCoverLookup, GsmtcCircuitBreaker.ShouldSkipCover),
@@ -470,38 +534,165 @@ static async Task<string> HandleGetLyrics(
     LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] Lyrics: title={status.Title}, artist={status.Artist}, viaFallback={viaFallback}\n");
 
-    var (lyrics, lyricsTimedOut, _) = await WithTimeout(
-        lyricService.GetCurrentLyricsAsync(status, CancellationToken.None), 5000, "GetCurrentLyricsAsync");
-    if (lyricsTimedOut)
-    {
-        LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics TIMEOUT on lyric fetch — returning no-lyrics\n");
-        return JsonSerializer.Serialize(new
-        {
-            type = "lyrics",
-            found = false,
-            title = (string?)null,
-            artist = (string?)null,
-            fileName = (string?)null,
-            lrc = (string?)null,
-            source = (string?)null,
-            synced = false
-        });
-    }
+    var lyrics = await ResolveLyricsForStatus(status, lyricService, viaFallback);
+    return JsonSerializer.Serialize(BuildLyricsResponse(lyrics, viaFallback));
+}
+
+static async Task<string> HandleGetState(
+    WindowsMediaSessionService gsmtc,
+    Win32MediaService fallback,
+    LocalLyricService lyricService,
+    Func<bool> shouldSkipGsmtc)
+{
+    var statusJson = shouldSkipGsmtc()
+        ? SerializeStatusForState(await fallback.GetFastStatusAsync(CancellationToken.None), viaFallback: true)
+        : await HandleGetStatus(gsmtc, fallback, shouldSkipGsmtc);
+    using var doc = JsonDocument.Parse(statusJson);
+    var statusElement = doc.RootElement.Clone();
+    var status = MediaStatusFromJson(statusElement);
+    var viaFallback = statusElement.TryGetProperty("viaFallback", out var viaEl)
+                      && viaEl.ValueKind == JsonValueKind.True;
+
     LogPaths.SafeAppend(LogPaths.DebugLog,
-        $"[{DateTime.Now:HH:mm:ss}] Lyrics result: found={lyrics.Found}, source={lyrics.Source}, lrcLen={lyrics.Lrc?.Length ?? 0}\n");
+        $"[{DateTime.Now:HH:mm:ss}] State: title={status.Title}, artist={status.Artist}, viaFallback={viaFallback}\n");
+
+    var lyrics = await ResolveLyricsForStatus(status, lyricService, viaFallback);
+    var signature = ComputeStateSignature(status, lyrics?.Lrc);
+
     return JsonSerializer.Serialize(new
     {
-        type = "lyrics",
-        found = lyrics.Found,
-        title = lyrics.Title,
-        artist = lyrics.Artist,
-        fileName = lyrics.FileName,
-        lrc = lyrics.Lrc,
-        source = lyrics.Source,
-        synced = lyrics.Synced,
+        type = "state",
+        status = statusElement,
+        lyrics = BuildLyricsResponse(lyrics, viaFallback),
+        signature,
+        cached = lyrics?.Found ?? false
+    });
+}
+
+static string SerializeStatusForState(MediaStatus status, bool viaFallback)
+{
+    bool hasCover = status.CoverUrl is not null
+        || string.Equals(status.Source, "QQMusic", StringComparison.Ordinal);
+    return JsonSerializer.Serialize(new
+    {
+        type = "status",
+        connected = status.Connected,
+        source = status.Source,
+        title = status.Title,
+        artist = status.Artist,
+        album = status.Album,
+        coverUrl = (string?)null,
+        hasCover,
+        isPlaying = status.IsPlaying,
+        positionMs = status.PositionMs,
+        durationMs = status.DurationMs,
+        updatedAt = status.UpdatedAt.ToString("o"),
         viaFallback
     });
+}
+
+static async Task<xiaoxu_music_bridge.Lyrics.LyricResponse?> ResolveLyricsForStatus(
+    MediaStatus status,
+    LocalLyricService lyricService,
+    bool viaFallback)
+{
+    // v3.2.10 hotfix: check the shared LyricPrefetchCache first. If a
+    // TrackChanged prefetch already populated this (title, artist) — or
+    // BridgeHttpServer did during a parallel HTTP poll — return it inline
+    // (0ms) instead of paying the 1-3s QQ Music API round-trip.
+    xiaoxu_music_bridge.Lyrics.LyricResponse? lyrics;
+    bool cacheHit = LyricPrefetchCache.TryGet(status.Title, status.Artist, out var cached)
+                    && cached != null
+                    && cached.Found;
+    if (cacheHit)
+    {
+        lyrics = cached;
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{DateTime.Now:HH:mm:ss}] Lyrics: cache HIT for title={status.Title} (lrcLen={lyrics!.Lrc?.Length ?? 0})\n");
+    }
+    else
+    {
+        var (l, lyricsTimedOut, _) = await WithTimeout(
+            lyricService.GetCurrentLyricsAsync(status, CancellationToken.None), 5000, "GetCurrentLyricsAsync");
+        lyrics = l;
+        if (lyricsTimedOut)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss}] HandleGetLyrics TIMEOUT on lyric fetch — returning no-lyrics\n");
+            return null;
+        }
+        // Populate the cache so subsequent TrackChanged-poll cycles hit
+        // 0ms for this song. If !Found we don't cache (negative result
+        // shouldn't lock out a later retry that might succeed).
+        if (lyrics != null && lyrics.Found)
+        {
+            LyricPrefetchCache.Store(status.Title, status.Artist, lyrics);
+        }
+    }
+    LogPaths.SafeAppend(LogPaths.DebugLog,
+        $"[{DateTime.Now:HH:mm:ss}] Lyrics result: found={lyrics?.Found}, source={lyrics?.Source}, lrcLen={lyrics?.Lrc?.Length ?? 0}\n");
+    return lyrics;
+}
+
+static object BuildLyricsResponse(xiaoxu_music_bridge.Lyrics.LyricResponse? lyrics, bool viaFallback)
+{
+    return new
+    {
+        type = "lyrics",
+        found = lyrics?.Found ?? false,
+        title = lyrics?.Title,
+        artist = lyrics?.Artist,
+        fileName = lyrics?.FileName,
+        lrc = lyrics?.Lrc,
+        source = lyrics?.Source,
+        synced = lyrics?.Synced ?? false,
+        viaFallback
+    };
+}
+
+static MediaStatus MediaStatusFromJson(JsonElement status)
+{
+    string? StringProp(string name) =>
+        status.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.String
+            ? el.GetString()
+            : null;
+
+    bool BoolProp(string name) =>
+        status.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.True;
+
+    long LongProp(string name) =>
+        status.TryGetProperty(name, out var el) && el.TryGetInt64(out var value)
+            ? value
+            : 0;
+
+    DateTimeOffset updatedAt = DateTimeOffset.Now;
+    var updatedAtRaw = StringProp("updatedAt");
+    if (!string.IsNullOrWhiteSpace(updatedAtRaw)
+        && DateTimeOffset.TryParse(updatedAtRaw, out var parsedUpdatedAt))
+    {
+        updatedAt = parsedUpdatedAt;
+    }
+
+    return new MediaStatus(
+        Connected: BoolProp("connected"),
+        Source: StringProp("source"),
+        Title: StringProp("title"),
+        Artist: StringProp("artist"),
+        Album: StringProp("album"),
+        CoverUrl: StringProp("coverUrl"),
+        IsPlaying: BoolProp("isPlaying"),
+        PositionMs: LongProp("positionMs"),
+        DurationMs: LongProp("durationMs"),
+        UpdatedAt: updatedAt);
+}
+
+static string ComputeStateSignature(MediaStatus status, string? lrc)
+{
+    var input = $"{status.Source}|{status.Title}|{status.Artist}|{status.Album}|{lrc}";
+    var bytes = SHA1.HashData(Encoding.UTF8.GetBytes(input));
+    var sb = new StringBuilder(16);
+    for (var i = 0; i < 8; i++) sb.Append(bytes[i].ToString("x2"));
+    return sb.ToString();
 }
 
 static async Task<string> HandleGetCover(
@@ -631,7 +822,7 @@ static async Task<string> HandleGetCover(
                     string? artist = gsmtcStatus.Artist;
                     if (string.IsNullOrWhiteSpace(title))
                     {
-                        var win32 = await fallback.GetStatusAsync(CancellationToken.None);
+                        var win32 = await fallback.GetFastStatusAsync(CancellationToken.None);
                         title = win32.Title;
                         artist = win32.Artist;
                         LogPaths.SafeAppend(LogPaths.DebugLog,
@@ -647,17 +838,17 @@ static async Task<string> HandleGetCover(
         GsmtcHealthTracker.RecordFailure("GetCurrentCoverAsync", coverSyncFault);
         GsmtcCircuitBreaker.OpenCover();
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT → Win32 fallback + QQ/iTunes cover lookup\n");
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC TIMEOUT → Win32 fast fallback + QQ/iTunes cover lookup\n");
     }
     else
     {
         LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC skipped (circuit breaker open) → Win32 fallback + QQ/iTunes cover lookup\n");
+            $"[{DateTime.Now:HH:mm:ss}] HandleGetCover GSMTC skipped (circuit breaker open) → Win32 fast fallback + QQ/iTunes cover lookup\n");
     }
 
     // --- Tier 3: GSMTC unavailable — Win32 title/artist → QQ → iTunes -------
 
-    var fbStatus = await fallback.GetStatusAsync(CancellationToken.None);
+    var fbStatus = await fallback.GetFastStatusAsync(CancellationToken.None);
     if (string.IsNullOrWhiteSpace(fbStatus.Title))
     {
         return NoCover(viaFallback: true);
