@@ -112,6 +112,19 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
     private string _lastScannedSongKey = "";
     private DateTime _lastScanCompletedAt = DateTime.MinValue;
 
+    // v3.2.10: TrackChanged event. Fires when the daemon window's title|artist
+    // key transitions between polls. Subscribers (BridgeHttpServer) use it to
+    // fire-and-forget a lyric prefetch so the next /state/current poll returns
+    // the new song's lyrics inline (0ms cache hit) instead of paying the 1-3s
+    // QQ Music search+LRC HTTP round-trip on the response critical path.
+    //
+    // Last-emitted tracking uses whitespace-trimmed values so transient UI
+    // refreshes ("Song  -  Artist" → "Song - Artist") don't fire spurious
+    // events. We only emit when the normalized key actually changes.
+    public event EventHandler? TrackChanged;
+    private string? _lastEmittedTitle;
+    private string? _lastEmittedArtist;
+
     public void AttachBeatService(AudioBeatService? svc) => _beat = svc;
 
     public async Task<MediaStatus> GetStatusAsync(CancellationToken cancellationToken)
@@ -192,6 +205,25 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
             // Pull duration from on-disk .lrc (best-effort, non-blocking).
             // Only attempts the first time we see this song key.
             if (hasTrack) durMs = await TryLyricFileDuration(title!, artist, durMs, cancellationToken);
+        }
+
+        // v3.2.10: Fire TrackChanged when (title, artist) transitions. Trim
+        // whitespace before comparing so transient UI refreshes don't trigger
+        // spurious prefetch fetches. Subscribers (BridgeHttpServer) MUST be
+        // non-blocking — they run on this thread otherwise the COM API /
+        // window scan would stall while a 1-3s lyric lookup is in flight.
+        var normTitle = title?.Trim();
+        var normArtist = artist?.Trim();
+        if (hasTrack && (normTitle != _lastEmittedTitle || normArtist != _lastEmittedArtist))
+        {
+            _lastEmittedTitle = normTitle;
+            _lastEmittedArtist = normArtist;
+            try { TrackChanged?.Invoke(this, EventArgs.Empty); }
+            catch (Exception ex)
+            {
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss}] [Win32] TrackChanged subscriber threw: {ex.GetType().Name}: {ex.Message}\n");
+            }
         }
 
         return new MediaStatus(

@@ -52,7 +52,7 @@ namespace xiaoxu_music_bridge.Bridge;
 public sealed class BridgeHttpServer : IDisposable
 {
     private const int Port = 17888;
-    private const string HostVersion = "3.2.9";
+    private const string HostVersion = "3.2.10";
 
     // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
     // user's machine during frontend iteration without modifying this list.
@@ -109,6 +109,15 @@ public sealed class BridgeHttpServer : IDisposable
     {
         _gsmtc = gsmtc;
         _win32Fallback = win32Fallback;
+
+        // v3.2.10: subscribe to song-change events from Win32MediaService.
+        // The handler fire-and-forget prefetches lyrics so the next
+        // /state/current poll (4Hz) returns the new song's lyrics from cache
+        // instead of paying the 1-3s QQ Music API round-trip inline. This
+        // collapses the lyric-switch latency from 1-3s freeze on the
+        // previous song's last line to a 0ms cache hit on the first poll
+        // after the song change.
+        _win32Fallback.TrackChanged += OnWin32TrackChanged;
     }
 
     /// <summary>
@@ -176,7 +185,91 @@ public sealed class BridgeHttpServer : IDisposable
         _listener = null;
     }
 
-    public void Dispose() => Stop();
+    public void Dispose()
+    {
+        try { _win32Fallback.TrackChanged -= OnWin32TrackChanged; } catch { }
+        Stop();
+    }
+
+    // --- v3.2.10: TrackChanged prefetch ------------------------------------
+
+    /// <summary>
+    /// v3.2.10: when Win32MediaService detects a (title, artist) transition,
+    /// prefetch the lyrics in the background so the next /state/current poll
+    /// returns from cache (0ms). Locks the song by snapshotting title/artist
+    /// before the lookup; if the user has switched again by the time the
+    /// lookup returns (1-3s window), discard the prefetch. This is the
+    /// user's chosen race-resolution strategy — see plan v3.2.10 § A2.
+    /// </summary>
+    private void OnWin32TrackChanged(object? sender, EventArgs e)
+    {
+        // Fire-and-forget. The handler MUST NOT block the COM API / window
+        // scan thread that raised the event, or the dashboard's next
+        // /state/current poll would stall on a slow lyric lookup.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var status = await _win32Fallback.GetStatusAsync(CancellationToken.None);
+                if (status == null || string.IsNullOrWhiteSpace(status.Title)) return;
+
+                var lookupTitle = status.Title.Trim();
+                var lookupArtist = status.Artist?.Trim();
+
+                LocalLyricService? svc;
+                lock (_lyricLock) svc = _lyricService;
+                if (svc == null)
+                {
+                    Log("TrackChanged prefetch skipped: lyric service not attached yet");
+                    return;
+                }
+
+                var lyrics = await ResolveLyricsAsync(lookupTitle, lookupArtist, viaFallback: true);
+                if (lyrics == null || !lyrics.Found)
+                {
+                    Log($"TrackChanged prefetch: no lyrics for '{lookupTitle}' — not caching");
+                    return;
+                }
+
+                // Re-check after the await — discard stale prefetch if the
+                // user has already switched to another song.
+                var now = await _win32Fallback.GetStatusAsync(CancellationToken.None);
+                var nowTitle = now?.Title?.Trim();
+                var nowArtist = now?.Artist?.Trim();
+                if (nowTitle != lookupTitle || nowArtist != lookupArtist)
+                {
+                    Log($"TrackChanged prefetch discarded (status changed): expected='{lookupTitle}' got='{nowTitle}'");
+                    return;
+                }
+
+                // Prime both viaFallback keys so the next poll hits cache
+                // regardless of which side of the GSMTC circuit breaker the
+                // dashboard is on.
+                PrimeLyricCache(lookupTitle, lookupArtist, viaFallback: false, lyrics);
+                PrimeLyricCache(lookupTitle, lookupArtist, viaFallback: true, lyrics);
+                Log($"TrackChanged prefetch → stored (title='{lookupTitle}', artist='{lookupArtist}', lrcLen={lyrics.Lrc?.Length ?? 0})");
+            }
+            catch (Exception ex)
+            {
+                Log($"TrackChanged prefetch failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Write a lyric lookup result directly into the cache for the given
+    /// (title, artist, viaFallback) key. Used by the TrackChanged prefetch
+    /// path so the next /state/current poll returns it inline (0ms).
+    /// Mirrors the cache key shape used in BuildStateResponseAsync:
+    /// "{title}|{artist}|{viaFallback}".
+    /// </summary>
+    public void PrimeLyricCache(string title, string? artist, bool viaFallback, LyricResponse lyrics)
+    {
+        var key = $"{title}|{artist}|{viaFallback}";
+        _lyricCacheLock.EnterWriteLock();
+        try { _lyricCache[key] = lyrics; }
+        finally { _lyricCacheLock.ExitWriteLock(); }
+    }
 
     // --- Main loop ---------------------------------------------------------
 
