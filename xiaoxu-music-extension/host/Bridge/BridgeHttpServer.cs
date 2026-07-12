@@ -52,7 +52,7 @@ namespace xiaoxu_music_bridge.Bridge;
 public sealed class BridgeHttpServer : IDisposable
 {
     private const int Port = 17888;
-    private const string HostVersion = "3.2.18";
+    private const string HostVersion = "3.2.19";
 
     // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
     // user's machine during frontend iteration without modifying this list.
@@ -316,6 +316,16 @@ public sealed class BridgeHttpServer : IDisposable
                     var cmd = path.Substring("/control/".Length);
                     var result = await SendControlAsync(cmd);
                     WriteJson(ctx, result.ok ? 200 : 500, new { ok = result.ok, error = result.error, viaFallback = result.viaFallback });
+                }
+                break;
+
+            case "/debug/lyric-clock":
+                {
+                    using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding ?? Encoding.UTF8);
+                    var body = await reader.ReadToEndAsync();
+                    if (body.Length > 4000) body = body.Substring(0, 4000);
+                    Log($"[LyricClockClient] {body}");
+                    WriteJson(ctx, 200, new { ok = true });
                 }
                 break;
 
