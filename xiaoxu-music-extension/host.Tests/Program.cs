@@ -81,13 +81,19 @@ Run("timeout wrapper captures exceptions thrown before a Task is returned", () =
     Equal(typeof(FileNotFoundException), result.SyncFault?.GetType());
 });
 
+Run("final timeout explains that Windows restart may be required", () =>
+{
+    var message = MediaModePolicy.FinalRepairFailureMessage("gsmtc_timeout", "raw timeout");
+    Equal(true, message.Contains("restart Windows", StringComparison.Ordinal));
+});
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine(string.Join(Environment.NewLine, failures));
     return 1;
 }
 
-Console.WriteLine("PASS: 11 media mode tests");
+Console.WriteLine("PASS: 12 media mode tests");
 return 0;
 
 void Run(string name, Action test)
