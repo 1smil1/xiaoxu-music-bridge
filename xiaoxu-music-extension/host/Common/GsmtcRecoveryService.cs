@@ -75,33 +75,13 @@ public sealed class GsmtcRecoveryService
         }
     }
 
-    public static int RestartAudioServicesElevatedHelper(string? reportPath)
+    public static int RestartAudioServicesElevatedHelper()
     {
-        var commandResults = new List<object>();
-        try
-        {
-            var initialEndpointState = QueryServiceState("AudioEndpointBuilder");
-            var initialAudioState = QueryServiceState("Audiosrv");
-            foreach (var command in AudioServiceRecoveryPlan.CommandsForStates(initialEndpointState, initialAudioState))
-            {
-                var ok = Run("net.exe", command.Arguments, 20_000, command.AllowFailure);
-                commandResults.Add(new { command = command.Arguments, ok });
-                if (!ok) break;
-            }
-        }
-        finally
-        {
-            // A repair must never leave Windows Audio stopped, even when an
-            // earlier command times out or fails halfway through.
-            Run("net.exe", "start AudioEndpointBuilder", 20_000, allowFailure: true);
-            Run("net.exe", "start Audiosrv", 20_000, allowFailure: true);
-        }
-
-        var endpointState = QueryServiceState("AudioEndpointBuilder");
-        var audioState = QueryServiceState("Audiosrv");
-        var recovered = AudioServiceRecoveryPlan.IsRecovered(endpointState, audioState);
-        WriteRecoveryReport(reportPath, new { recovered, endpointState, audioState, commands = commandResults });
-        return recovered ? 0 : 1;
+        return Run("net.exe", "stop audiosrv /y", 20_000)
+            && Run("net.exe", "start audiosrv", 20_000)
+            && Run("net.exe", "stop AudioEndpointBuilder /y", 20_000, allowFailure: true)
+            && Run("net.exe", "start AudioEndpointBuilder", 20_000)
+            ? 0 : 1;
     }
 
     private static async Task<GsmtcProbeResult> RunProbeProcessAsync(CancellationToken cancellationToken)
@@ -138,14 +118,13 @@ public sealed class GsmtcRecoveryService
 
     private static async Task<(bool ok, string code, string message)> RestartAudioServicesElevatedAsync(CancellationToken cancellationToken)
     {
-        var reportPath = Path.Combine(Path.GetTempPath(), $"xiaoxu-gsmtc-repair-{Guid.NewGuid():N}.json");
         try
         {
             var exe = Environment.ProcessPath ?? throw new InvalidOperationException("Cannot locate host executable");
             using var process = Process.Start(new ProcessStartInfo
             {
                 FileName = exe,
-                Arguments = $"--restart-gsmtc-services \"{reportPath}\"",
+                Arguments = "--restart-gsmtc-services",
                 Verb = "runas",
                 UseShellExecute = true,
             });
@@ -153,10 +132,9 @@ public sealed class GsmtcRecoveryService
             var exitTask = process.WaitForExitAsync(cancellationToken);
             if (await Task.WhenAny(exitTask, Task.Delay(60_000, cancellationToken)) != exitTask)
                 return (false, "service_restart_failed", "Timed out waiting for the elevated audio service repair");
-            var report = File.Exists(reportPath) ? await File.ReadAllTextAsync(reportPath, cancellationToken) : "no recovery report";
             return process.ExitCode == 0
-                ? (true, "", report)
-                : (false, "service_restart_failed", $"Audio service repair exited with code {process.ExitCode}: {report}");
+                ? (true, "", "")
+                : (false, "service_restart_failed", $"Audio service repair exited with code {process.ExitCode}");
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
@@ -166,33 +144,6 @@ public sealed class GsmtcRecoveryService
         {
             return (false, "service_restart_failed", ex.Message);
         }
-        finally
-        {
-            try { File.Delete(reportPath); } catch { }
-        }
-    }
-
-    private static string QueryServiceState(string serviceName)
-    {
-        using var process = Process.Start(new ProcessStartInfo
-        {
-            FileName = "sc.exe",
-            Arguments = $"query {serviceName}",
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-        });
-        if (process is null || !process.WaitForExit(10_000)) return "UNKNOWN";
-        var output = process.StandardOutput.ReadToEnd();
-        if (output.Contains("RUNNING", StringComparison.OrdinalIgnoreCase)) return "RUNNING";
-        if (output.Contains("STOPPED", StringComparison.OrdinalIgnoreCase)) return "STOPPED";
-        return "UNKNOWN";
-    }
-
-    private static void WriteRecoveryReport(string? reportPath, object report)
-    {
-        if (string.IsNullOrWhiteSpace(reportPath)) return;
-        try { File.WriteAllText(reportPath, JsonSerializer.Serialize(report)); } catch { }
     }
 
     private static bool Run(string fileName, string arguments, int timeoutMs, bool allowFailure = false)

@@ -22,9 +22,7 @@ if (args.Contains("--gsmtc-probe", StringComparer.OrdinalIgnoreCase))
 
 if (args.Contains("--restart-gsmtc-services", StringComparer.OrdinalIgnoreCase))
 {
-    var markerIndex = Array.FindIndex(args, value => value.Equals("--restart-gsmtc-services", StringComparison.OrdinalIgnoreCase));
-    var reportPath = markerIndex >= 0 && markerIndex + 1 < args.Length ? args[markerIndex + 1] : null;
-    Environment.Exit(GsmtcRecoveryService.RestartAudioServicesElevatedHelper(reportPath));
+    Environment.Exit(GsmtcRecoveryService.RestartAudioServicesElevatedHelper());
     return;
 }
 

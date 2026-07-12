@@ -10,6 +10,5 @@
     <Compile Include="../host/Common/MediaModePolicy.cs" Link="MediaModePolicy.cs" />
     <Compile Include="../host/Common/GsmtcProbeResult.cs" Link="GsmtcProbeResult.cs" />
     <Compile Include="../host/Common/TaskTimeout.cs" Link="TaskTimeout.cs" />
-    <Compile Include="../host/Common/AudioServiceRecoveryPlan.cs" Link="AudioServiceRecoveryPlan.cs" />
   </ItemGroup>
 </Project>
