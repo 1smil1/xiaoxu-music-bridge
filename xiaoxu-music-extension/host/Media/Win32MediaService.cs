@@ -98,6 +98,7 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
     private DateTime _clockLastTickAt;
     private int _clockConsecutivePausedTicks;
     private int _clockConsecutivePlayingTicks;
+    private bool _clockLastTrustedPlaying;
     private readonly object _fastPlaybackLock = new();
     private string _fastPlaybackKey = "";
     private bool _fastPlaybackAssumedPlaying = true;
@@ -327,6 +328,7 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
                 _clockLastTickAt = now;
                 _clockConsecutivePlayingTicks = 0;
                 _clockConsecutivePausedTicks = 0;
+                _clockLastTrustedPlaying = false;
                 LogPaths.SafeAppend(LogPaths.DebugLog,
                     $"[{DateTime.Now:HH:mm:ss.fff}] [VirtualClock] song change → reset anchor (key='{currentKey}')\n");
                 return 0;
@@ -354,6 +356,12 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
                 _clockAccumulatedMs += dt;
             }
             _clockLastTickAt = now;
+            if (dt >= 750 || trustedPlaying != _clockLastTrustedPlaying || !beatIsPlaying)
+            {
+                LogPaths.SafeAppend(LogPaths.DebugLog,
+                    $"[{DateTime.Now:HH:mm:ss.fff}] [VirtualClock] tick key='{currentKey}' rawBeat={beatIsPlaying} trusted={trustedPlaying} dt={dt}ms pos={_clockAccumulatedMs}ms playTicks={_clockConsecutivePlayingTicks} pauseTicks={_clockConsecutivePausedTicks}\n");
+            }
+            _clockLastTrustedPlaying = trustedPlaying;
 
             return Math.Max(0, _clockAccumulatedMs);
         }
