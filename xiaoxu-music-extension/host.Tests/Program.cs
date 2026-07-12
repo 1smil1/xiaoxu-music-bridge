@@ -87,13 +87,34 @@ Run("final timeout explains that Windows restart may be required", () =>
     Equal(true, message.Contains("restart Windows", StringComparison.Ordinal));
 });
 
+Run("audio recovery starts endpoint builder before Windows Audio", () =>
+{
+    Equal("stop AudioEndpointBuilder /y", AudioServiceRecoveryPlan.Commands[0].Arguments);
+    Equal("start AudioEndpointBuilder", AudioServiceRecoveryPlan.Commands[1].Arguments);
+    Equal("start Audiosrv", AudioServiceRecoveryPlan.Commands[2].Arguments);
+});
+
+Run("audio recovery succeeds only when both services are running", () =>
+{
+    Equal(true, AudioServiceRecoveryPlan.IsRecovered("RUNNING", "RUNNING"));
+    Equal(false, AudioServiceRecoveryPlan.IsRecovered("RUNNING", "STOPPED"));
+    Equal(false, AudioServiceRecoveryPlan.IsRecovered("STOPPED", "RUNNING"));
+});
+
+Run("audio recovery only starts Windows Audio when endpoint builder is healthy", () =>
+{
+    var commands = AudioServiceRecoveryPlan.CommandsForStates("RUNNING", "STOPPED");
+    Equal(1, commands.Count);
+    Equal("start Audiosrv", commands[0].Arguments);
+});
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine(string.Join(Environment.NewLine, failures));
     return 1;
 }
 
-Console.WriteLine("PASS: 12 media mode tests");
+Console.WriteLine("PASS: 15 media mode and recovery tests");
 return 0;
 
 void Run(string name, Action test)
