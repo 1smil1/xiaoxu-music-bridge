@@ -19,18 +19,34 @@ public sealed class GsmtcRecoveryService
             GsmtcHealthTracker.ResetRecoveryState();
             GsmtcCircuitBreaker.Reset();
 
+            Log("repair started: recovery state reset");
             var first = await RunProbeProcessAsync(cancellationToken);
-            if (first.IsSuccess) return Success(mode, first, restarted: false);
-            if (first.ErrorCode is "missing_dependency" or "gsmtc_activation_failed" or "no_media_session")
+            LogProbe("initial-probe", first);
+            if (first.IsSuccess) return Success(mode, first, restarted: "none");
+            if (!MediaModePolicy.ShouldRestartBroker(first.ErrorCode))
                 return Failure(first.ErrorCode!, first.ErrorMessage ?? "GSMTC probe failed", "probe", mode);
 
+            RestartRuntimeBroker();
+            await Task.Delay(1500, cancellationToken);
+            var afterBroker = await RunProbeProcessAsync(cancellationToken);
+            LogProbe("runtime-broker-verify", afterBroker);
+            if (afterBroker.IsSuccess) return Success(mode, afterBroker, restarted: "runtimeBroker");
+            if (!MediaModePolicy.ShouldRestartBroker(afterBroker.ErrorCode))
+                return Failure(afterBroker.ErrorCode!, afterBroker.ErrorMessage ?? "GSMTC probe failed after RuntimeBroker restart", "broker-verify", mode);
+
+            Log("requesting elevated audio service restart");
             var restart = await RestartAudioServicesElevatedAsync(cancellationToken);
-            if (!restart.ok) return Failure(restart.code, restart.message, "service-restart", mode);
+            if (!restart.ok)
+            {
+                Log($"audio service restart failed: {restart.code}: {restart.message}");
+                return Failure(restart.code, restart.message, "service-restart", mode);
+            }
 
             var verified = await RunProbeProcessAsync(cancellationToken);
+            LogProbe("audio-service-verify", verified);
             return verified.IsSuccess
-                ? Success(mode, verified, restarted: true)
-                : Failure(verified.ErrorCode ?? "gsmtc_timeout", verified.ErrorMessage ?? "GSMTC verification failed", "verify", mode);
+                ? Success(mode, verified, restarted: "audioServices")
+                : Failure(verified.ErrorCode ?? "gsmtc_timeout", verified.ErrorMessage ?? "GSMTC still timed out after RuntimeBroker and audio service restart", "audio-verify", mode);
         }
         finally
         {
@@ -141,6 +157,29 @@ public sealed class GsmtcRecoveryService
         return allowFailure || process.ExitCode == 0;
     }
 
+    private static void RestartRuntimeBroker()
+    {
+        var sessionId = Process.GetCurrentProcess().SessionId;
+        var killed = 0;
+        foreach (var process in Process.GetProcessesByName("RuntimeBroker"))
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.SessionId != sessionId) continue;
+                    process.Kill(entireProcessTree: true);
+                    killed++;
+                }
+                catch (Exception ex)
+                {
+                    Log($"RuntimeBroker PID={process.Id} restart failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+        Log($"RuntimeBroker restart requested: killed={killed}, session={sessionId}");
+    }
+
     private static GsmtcProbeResult DependencyFailure(Exception ex) =>
         new(false, null, null, null, 0, 0, "missing_dependency", ex.Message);
 
@@ -150,11 +189,17 @@ public sealed class GsmtcRecoveryService
         return MediaModeStore.ToWireValue(new MediaModeStore(directory).Get());
     }
 
-    private static object Success(string mode, GsmtcProbeResult probe, bool restarted) => new
+    private static object Success(string mode, GsmtcProbeResult probe, string restarted) => new
     {
         ok = true, mode, repaired = true, restarted,
         session = new { source = probe.Source, title = probe.Title, artist = probe.Artist, positionMs = probe.PositionMs, durationMs = probe.DurationMs }
     };
+
+    private static void LogProbe(string stage, GsmtcProbeResult result) =>
+        Log($"{stage}: success={result.IsSuccess}, api={result.ApiAvailable}, code={result.ErrorCode ?? "none"}, source={result.Source ?? "none"}, title={result.Title ?? "none"}");
+
+    private static void Log(string message) => LogPaths.SafeAppend(LogPaths.DebugLog,
+        $"[{DateTime.Now:HH:mm:ss.fff}] [GsmtcRepair] {message}\n");
 
     private static object Failure(string code, string message, string stage, string? mode = null) => new
     {

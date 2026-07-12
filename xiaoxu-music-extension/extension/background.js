@@ -170,7 +170,7 @@ async function handleBridgeRequest(port, fetchId, message) {
   }
 
   if (pathname === '/health') {
-    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.3.0' } });
+    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.3.1' } });
     return;
   }
 

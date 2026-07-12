@@ -9,5 +9,6 @@
     <Compile Include="../host/Common/MediaModeStore.cs" Link="MediaModeStore.cs" />
     <Compile Include="../host/Common/MediaModePolicy.cs" Link="MediaModePolicy.cs" />
     <Compile Include="../host/Common/GsmtcProbeResult.cs" Link="GsmtcProbeResult.cs" />
+    <Compile Include="../host/Common/TaskTimeout.cs" Link="TaskTimeout.cs" />
   </ItemGroup>
 </Project>

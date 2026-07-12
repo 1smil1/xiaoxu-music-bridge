@@ -2,6 +2,9 @@ namespace xiaoxu_music_bridge.Common;
 
 public static class MediaModePolicy
 {
+    public static bool ShouldRecordGsmtcFailure(MediaMode mode) => mode == MediaMode.Auto;
+    public static bool ShouldRestartBroker(string? errorCode) => errorCode == "gsmtc_timeout";
+
     public static bool ShouldTryGsmtc(MediaMode mode, bool breakerOpen) => mode switch
     {
         MediaMode.Win32 => false,
