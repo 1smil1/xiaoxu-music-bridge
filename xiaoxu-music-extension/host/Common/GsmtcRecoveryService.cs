@@ -46,9 +46,7 @@ public sealed class GsmtcRecoveryService
             LogProbe("audio-service-verify", verified);
             return verified.IsSuccess
                 ? Success(mode, verified, restarted: "audioServices")
-                : Failure(verified.ErrorCode ?? "gsmtc_timeout",
-                    MediaModePolicy.FinalRepairFailureMessage(verified.ErrorCode, verified.ErrorMessage),
-                    "audio-verify", mode);
+                : Failure(verified.ErrorCode ?? "gsmtc_timeout", verified.ErrorMessage ?? "GSMTC still timed out after RuntimeBroker and audio service restart", "audio-verify", mode);
         }
         finally
         {
