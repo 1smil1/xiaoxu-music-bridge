@@ -40,6 +40,7 @@
           _bridgeFetchId: id,
           url: urlStr,
           method: options?.method || 'GET',
+          body: typeof options?.body === 'string' ? options.body : null,
         }, '*');
       });
     }

@@ -12,6 +12,20 @@ using xiaoxu_music_bridge.Common;
 // Chrome Native Messaging format: 4-byte little-endian uint32 length + UTF-8 JSON body
 // Read from stdin, write to stdout. No console window (OutputType=WinExe).
 
+if (args.Contains("--gsmtc-probe", StringComparer.OrdinalIgnoreCase))
+{
+    var result = await GsmtcRecoveryService.ProbeCurrentProcessAsync();
+    var bytes = JsonSerializer.SerializeToUtf8Bytes(result);
+    await Console.OpenStandardOutput().WriteAsync(bytes);
+    return;
+}
+
+if (args.Contains("--restart-gsmtc-services", StringComparer.OrdinalIgnoreCase))
+{
+    Environment.Exit(GsmtcRecoveryService.RestartAudioServicesElevatedHelper());
+    return;
+}
+
 try
 {
 // Log IMMEDIATELY — before any service initialization
@@ -38,6 +52,10 @@ var sharedHttp = new HttpClient();
 var coverLookup = new QqMusicCoverLookupService(sharedHttp);
 var itunesCoverLookup = new ITunesCoverLookupService(sharedHttp);
 var lyricService = new LocalLyricService(lyricsDir, sharedHttp);
+var mediaModeStore = new MediaModeStore(Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+    "xiaoxu-music-host"));
+var gsmtcRecovery = new GsmtcRecoveryService();
 
 // v3.2.10 hotfix: subscribe to Win32MediaService.TrackChanged at the top
 // level so the Native Messaging path (Program.cs HandleGetLyrics) also
@@ -154,6 +172,26 @@ LogPaths.SafeAppend(LogPaths.DebugLog,
 var stdin = Console.OpenStandardInput();
 var stdout = Console.OpenStandardOutput();
 
+// Start capture immediately so the HTTP bridge can use audio energy for
+// playback state before a browser extension sends subscribeBeat.
+if (beatService is null)
+{
+    beatService = new AudioBeatService(json =>
+    {
+        WriteMessage(stdout, json, stdoutLock);
+    });
+    beatService.Start();
+    if (debugServer is not null)
+    {
+        beatService.AttachDebugServer(debugServer);
+        debugServer.SetBeatService(beatService);
+    }
+    bridgeHttp.SetBeatService(beatService);
+    win32Fallback.AttachBeatService(beatService);
+    LogPaths.SafeAppend(LogPaths.DebugLog,
+        $"[{DateTime.Now:HH:mm:ss}] AudioBeatService STARTED at host startup\n");
+}
+
 while (true)
 {
     // Read 4-byte length prefix (little-endian uint32)
@@ -224,15 +262,18 @@ while (true)
 
         responseJson = type switch
         {
-            "getStatus" => await HandleGetStatus(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip),
-            "getState" => await HandleGetState(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
-            "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, doc.RootElement),
+            "getStatus" => await HandleGetStatus(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, mediaModeStore),
+            "getState" => await HandleGetState(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip, mediaModeStore),
+            "control" => await HandleControl(gsmtcService, win32Fallback, GsmtcCircuitBreaker.ShouldSkip, mediaModeStore, doc.RootElement),
             "getLyrics" => await HandleGetLyrics(gsmtcService, win32Fallback, lyricService, GsmtcCircuitBreaker.ShouldSkip),
             "getCover" => await HandleGetCover(gsmtcService, win32Fallback, coverLookup, itunesCoverLookup, GsmtcCircuitBreaker.ShouldSkipCover),
             "subscribeBeat" => HandleSubscribeBeat(ref beatService, ref debugServer, bridgeHttp, win32Fallback, stdout, stdoutLock),
             "unsubscribeBeat" => HandleUnsubscribeBeat(ref beatService),
             "getBeat" => HandleGetBeat(beatService),
             "getGsmtcHealth" => HandleGetGsmtcHealth(),
+            "getMediaMode" => JsonSerializer.Serialize(new { type = "mediaMode", mode = MediaModeStore.ToWireValue(mediaModeStore.Get()) }),
+            "setMediaMode" => HandleSetMediaMode(mediaModeStore, doc.RootElement),
+            "repairGsmtc" => JsonSerializer.Serialize(await gsmtcRecovery.RepairAsync(CancellationToken.None)),
             _ => JsonSerializer.Serialize(new { type = "error", message = $"Unknown command: {type}" })
         };
 
@@ -356,10 +397,12 @@ static async Task<(T Result, bool TimedOut, Exception? SyncFault)> WithTimeout<T
 static async Task<string> HandleGetStatus(
     WindowsMediaSessionService gsmtc,
     Win32MediaService fallback,
-    Func<bool> shouldSkipGsmtc)
+    Func<bool> shouldSkipGsmtc,
+    MediaModeStore mediaModeStore)
 {
+    var mode = mediaModeStore.Get();
     // Try GSMTC first unless the circuit breaker says it's been failing
-    if (!shouldSkipGsmtc())
+    if (MediaModePolicy.ShouldTryGsmtc(mode, shouldSkipGsmtc()))
     {
         var statusStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var (status, timedOut, syncFault) = await WithTimeout(
@@ -376,7 +419,7 @@ static async Task<string> HandleGetStatus(
             // visible to Win32. Try Win32 before returning the empty GSMTC
             // status — if Win32 found a track via QQMusic_Daemon_Wnd title,
             // return that instead.
-            if (string.IsNullOrEmpty(status.Title) && string.IsNullOrEmpty(status.Artist))
+            if (mode == MediaMode.Auto && string.IsNullOrEmpty(status.Title) && string.IsNullOrEmpty(status.Artist))
             {
                 LogPaths.SafeAppend(LogPaths.DebugLog,
                     $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC NoMedia (no session) -> probing Win32\n");
@@ -385,18 +428,24 @@ static async Task<string> HandleGetStatus(
                 {
                     LogPaths.SafeAppend(LogPaths.DebugLog,
                         $"[{DateTime.Now:HH:mm:ss}] Status (Win32 probe-recovered): title={probeStatus.Title}, artist={probeStatus.Artist}\n");
-                    return SerializeStatus(probeStatus, viaFallback: true);
+                    return SerializeStatus(probeStatus, true, fallback.LastPlaybackKnown, mode, MediaMode.Win32);
                 }
                 LogPaths.SafeAppend(LogPaths.DebugLog,
                     $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC NoMedia + Win32 also empty -> returning GSMTC NoMedia\n");
             }
             LogPaths.SafeAppend(LogPaths.DebugLog,
                 $"[{DateTime.Now:HH:mm:ss}] Status (GSMTC): title={status.Title}, artist={status.Artist}, pos={status.PositionMs}, dur={status.DurationMs}, dt={statusStopwatch.ElapsedMilliseconds}ms\n");
-            return SerializeStatus(status, viaFallback: false);
+            if (mode == MediaMode.Gsmtc && string.IsNullOrWhiteSpace(status.Title))
+                return SerializeStatus(status, false, false, mode, MediaMode.Gsmtc,
+                    new { code = "no_media_session", message = "No current GSMTC media session", stage = "probe" });
+            return SerializeStatus(status, false, true, mode, MediaMode.Gsmtc);
         }
         // Timed out — log failure and open the circuit breaker for 30s
         GsmtcHealthTracker.RecordFailure("GetStatusAsync", syncFault);
         GsmtcCircuitBreaker.Open();
+        if (mode == MediaMode.Gsmtc)
+            return SerializeStatus(MediaStatus.NoMedia(), false, false, mode, MediaMode.Gsmtc,
+                new { code = syncFault != null ? "gsmtc_activation_failed" : "gsmtc_timeout", message = syncFault?.Message ?? "GSMTC request timed out", stage = "probe" });
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC TIMEOUT → falling back to Win32 daemon title\n");
     }
@@ -409,9 +458,10 @@ static async Task<string> HandleGetStatus(
     var fbStatus = await fallback.GetStatusAsync(CancellationToken.None);
     LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] Status (Win32 fallback): title={fbStatus.Title}, artist={fbStatus.Artist}\n");
-    return SerializeStatus(fbStatus, viaFallback: true);
+    return SerializeStatus(fbStatus, mode == MediaMode.Auto, fallback.LastPlaybackKnown, mode, MediaMode.Win32);
 
-    static string SerializeStatus(MediaStatus status, bool viaFallback)
+    static string SerializeStatus(MediaStatus status, bool viaFallback, bool playbackKnown,
+        MediaMode requestedMode, MediaMode activeMode, object? mediaError = null)
     {
         // For QQ Music the native GSMTC thumbnail is usually null (CEF doesn't expose
         // it to Windows.Media). Mark hasCover=true when source=QQMusic so the bridge
@@ -430,10 +480,14 @@ static async Task<string> HandleGetStatus(
             coverUrl = (string?)null,
             hasCover,
             isPlaying = status.IsPlaying,
+            playbackKnown,
             positionMs = status.PositionMs,
             durationMs = status.DurationMs,
             updatedAt = status.UpdatedAt.ToString("o"),
-            viaFallback
+            viaFallback,
+            requestedMode = MediaModeStore.ToWireValue(requestedMode),
+            activeMode = MediaModeStore.ToWireValue(activeMode),
+            mediaError
         });
     }
 }
@@ -447,8 +501,10 @@ static async Task<string> HandleControl(
     WindowsMediaSessionService gsmtc,
     Win32MediaService fallback,
     Func<bool> shouldSkipGsmtc,
+    MediaModeStore mediaModeStore,
     JsonElement request)
 {
+    var mode = mediaModeStore.Get();
     var commandStr = request.GetProperty("command").GetString() ?? "";
     var command = commandStr switch
     {
@@ -458,7 +514,7 @@ static async Task<string> HandleControl(
         _ => throw new ArgumentException($"Unknown command: {commandStr}")
     };
 
-    if (!shouldSkipGsmtc())
+    if (MediaModePolicy.ShouldTryGsmtc(mode, shouldSkipGsmtc()))
     {
         var (result, timedOut, syncFault) = await WithTimeout(
             gsmtc.SendCommandAsync(command, CancellationToken.None), 1500, "SendCommandAsync");
@@ -475,6 +531,8 @@ static async Task<string> HandleControl(
         }
         GsmtcHealthTracker.RecordFailure("SendCommandAsync", syncFault);
         GsmtcCircuitBreaker.Open();
+        if (mode == MediaMode.Gsmtc)
+            return JsonSerializer.Serialize(new { type = "error", message = syncFault?.Message ?? "GSMTC control timed out" });
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleControl GSMTC TIMEOUT control={commandStr} → media keys\n");
     }
@@ -491,7 +549,7 @@ static async Task<string> HandleControl(
         type = "controlResult",
         ok = fbResult.Ok,
         error = fbResult.Error,
-        viaFallback = true
+        viaFallback = mode == MediaMode.Auto
     });
 }
 
@@ -542,11 +600,20 @@ static async Task<string> HandleGetState(
     WindowsMediaSessionService gsmtc,
     Win32MediaService fallback,
     LocalLyricService lyricService,
-    Func<bool> shouldSkipGsmtc)
+    Func<bool> shouldSkipGsmtc,
+    MediaModeStore mediaModeStore)
 {
-    var statusJson = shouldSkipGsmtc()
-        ? SerializeStatusForState(await fallback.GetFastStatusAsync(CancellationToken.None), viaFallback: true)
-        : await HandleGetStatus(gsmtc, fallback, shouldSkipGsmtc);
+    var mode = mediaModeStore.Get();
+    string statusJson;
+    if (mode == MediaMode.Win32 || (mode == MediaMode.Auto && shouldSkipGsmtc()))
+    {
+        var fast = await fallback.GetFastStatusAsync(CancellationToken.None);
+        statusJson = SerializeFastWin32Status(fast, mode == MediaMode.Auto, fallback.LastPlaybackKnown, mode);
+    }
+    else
+    {
+        statusJson = await HandleGetStatus(gsmtc, fallback, shouldSkipGsmtc, mediaModeStore);
+    }
     using var doc = JsonDocument.Parse(statusJson);
     var statusElement = doc.RootElement.Clone();
     var status = MediaStatusFromJson(statusElement);
@@ -569,10 +636,8 @@ static async Task<string> HandleGetState(
     });
 }
 
-static string SerializeStatusForState(MediaStatus status, bool viaFallback)
+static string SerializeFastWin32Status(MediaStatus status, bool viaFallback, bool playbackKnown, MediaMode requestedMode)
 {
-    bool hasCover = status.CoverUrl is not null
-        || string.Equals(status.Source, "QQMusic", StringComparison.Ordinal);
     return JsonSerializer.Serialize(new
     {
         type = "status",
@@ -582,12 +647,16 @@ static string SerializeStatusForState(MediaStatus status, bool viaFallback)
         artist = status.Artist,
         album = status.Album,
         coverUrl = (string?)null,
-        hasCover,
+        hasCover = status.CoverUrl is not null || string.Equals(status.Source, "QQMusic", StringComparison.Ordinal),
         isPlaying = status.IsPlaying,
+        playbackKnown,
         positionMs = status.PositionMs,
         durationMs = status.DurationMs,
         updatedAt = status.UpdatedAt.ToString("o"),
-        viaFallback
+        viaFallback,
+        requestedMode = MediaModeStore.ToWireValue(requestedMode),
+        activeMode = "win32",
+        mediaError = (object?)null,
     });
 }
 
@@ -933,6 +1002,15 @@ static string HandleGetGsmtcHealth()
         isPermanentlyBroken = GsmtcHealthTracker.IsPermanentlyBroken,
         stuckThreshold = GsmtcHealthTracker.StuckThreshold,
     });
+}
+
+static string HandleSetMediaMode(MediaModeStore store, JsonElement request)
+{
+    var value = request.TryGetProperty("mode", out var element) ? element.GetString() : null;
+    if (!MediaModeStore.TryParse(value, out var mode))
+        return JsonSerializer.Serialize(new { type = "error", message = "Invalid media mode" });
+    store.Set(mode);
+    return JsonSerializer.Serialize(new { type = "mediaMode", mode = MediaModeStore.ToWireValue(mode) });
 }
 
 }

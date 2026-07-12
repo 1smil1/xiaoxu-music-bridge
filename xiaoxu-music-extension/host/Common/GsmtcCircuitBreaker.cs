@@ -43,6 +43,11 @@ public static class GsmtcCircuitBreaker
         TriggerProbe();
     }
     public static void Close() => _skipUntil = DateTime.MinValue;
+    public static void Reset()
+    {
+        _skipUntil = DateTime.MinValue;
+        _coverSkipUntil = DateTime.MinValue;
+    }
     public static bool ShouldSkip()
     {
         // v3.2.5: permanent broken flag wins over the 30s timer. Once GSMTC

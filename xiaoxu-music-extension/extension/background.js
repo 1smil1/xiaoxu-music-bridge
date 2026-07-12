@@ -110,7 +110,7 @@ function connectHost() {
   return host;
 }
 
-function sendToHost(message) {
+function sendToHost(message, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const h = connectHost();
     if (!h) {
@@ -127,7 +127,7 @@ function sendToHost(message) {
         pending.delete(id);
         reject(new Error('Native host response timeout'));
       }
-    }, 10000);
+    }, timeoutMs);
   });
 }
 
@@ -170,7 +170,7 @@ async function handleBridgeRequest(port, fetchId, message) {
   }
 
   if (pathname === '/health') {
-    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.2.16' } });
+    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.3.0' } });
     return;
   }
 
@@ -189,6 +189,10 @@ async function handleBridgeRequest(port, fetchId, message) {
       connected: !!statusResp.connected,
       source: statusResp.source ?? null,
       viaFallback: statusResp.viaFallback ?? false,
+      playbackKnown: statusResp.playbackKnown,
+      requestedMode: statusResp.requestedMode ?? 'auto',
+      activeMode: statusResp.activeMode ?? (statusResp.viaFallback ? 'win32' : 'gsmtc'),
+      mediaError: statusResp.mediaError ?? null,
       title: statusResp.title ?? null,
       artist: statusResp.artist ?? null,
       album: statusResp.album ?? null,
@@ -240,7 +244,22 @@ async function handleBridgeRequest(port, fetchId, message) {
   }
 
   let hostMessage;
-  if (pathname === '/status' || pathname === '/api/status') {
+  if (pathname === '/settings/media-mode') {
+    if ((message.method || 'GET').toUpperCase() === 'PUT') {
+      let mode;
+      try { mode = JSON.parse(message.body || '{}').mode; } catch (_) {
+        reply({ ok: false, status: 400, data: { error: 'invalid JSON body' } });
+        return;
+      }
+      hostMessage = { type: 'setMediaMode', mode };
+    } else {
+      hostMessage = { type: 'getMediaMode' };
+    }
+  } else if (pathname === '/gsmtc/repair') {
+    hostMessage = { type: 'repairGsmtc' };
+  } else if (pathname === '/gsmtc/health') {
+    hostMessage = { type: 'getGsmtcHealth' };
+  } else if (pathname === '/status' || pathname === '/api/status') {
     hostMessage = { type: 'getStatus' };
   } else if (pathname.startsWith('/control/')) {
     const cmd = pathname.split('/').pop();
@@ -255,7 +274,7 @@ async function handleBridgeRequest(port, fetchId, message) {
   }
 
   try {
-    const response = await sendToHost(hostMessage);
+    const response = await sendToHost(hostMessage, pathname === '/gsmtc/repair' ? 90000 : 10000);
     if (response.type === 'status' && (response.hasCover || response.source === 'QQMusic')) {
       const cover = await sendToHost({ type: 'getCover' });
       if (cover.data) {
@@ -271,7 +290,8 @@ async function handleBridgeRequest(port, fetchId, message) {
       chrome.storage.session.set({ coverDataUrl: null });
     }
     const ok = response.type !== 'error';
-    reply({ ok, status: ok ? 200 : 503, data: response });
+    const status = ok ? 200 : (response.message === 'Invalid media mode' ? 400 : 503);
+    reply({ ok, status, data: response });
   } catch (err) {
     reply({ ok: false, status: 503, data: { error: err.message } });
   }

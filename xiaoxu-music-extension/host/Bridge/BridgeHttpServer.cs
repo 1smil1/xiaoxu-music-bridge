@@ -52,7 +52,7 @@ namespace xiaoxu_music_bridge.Bridge;
 public sealed class BridgeHttpServer : IDisposable
 {
     private const int Port = 17888;
-    private const string HostVersion = "3.2.19";
+    private const string HostVersion = "3.3.0";
 
     // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
     // user's machine during frontend iteration without modifying this list.
@@ -66,12 +66,14 @@ public sealed class BridgeHttpServer : IDisposable
         "http://127.0.0.1:3000",
     };
 
-    private const string AllowMethods = "GET, POST, OPTIONS";
+    private const string AllowMethods = "GET, PUT, POST, OPTIONS";
     private const string AllowHeaders = "Content-Type";
     private const string MaxAge = "86400";
 
     private readonly WindowsMediaSessionService _gsmtc;
     private readonly Win32MediaService _win32Fallback;
+    private readonly MediaModeStore _mediaModeStore;
+    private readonly GsmtcRecoveryService _gsmtcRecovery = new();
     private readonly object _lyricLock = new();
     private LocalLyricService? _lyricService;
     private readonly object _coverLock = new();
@@ -110,6 +112,9 @@ public sealed class BridgeHttpServer : IDisposable
     {
         _gsmtc = gsmtc;
         _win32Fallback = win32Fallback;
+        _mediaModeStore = new MediaModeStore(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "xiaoxu-music-host"));
 
         // v3.2.10 hotfix: lyric prefetch subscription moved to Program.cs
         // (top-level statement) so it benefits the Native Messaging path
@@ -246,6 +251,9 @@ public sealed class BridgeHttpServer : IDisposable
                 case "POST":
                     await HandlePost(ctx, path);
                     break;
+                case "PUT":
+                    await HandlePut(ctx, path);
+                    break;
                 default:
                     WriteJson(ctx, 405, new { error = "method not allowed", method = req.HttpMethod });
                     break;
@@ -299,6 +307,25 @@ public sealed class BridgeHttpServer : IDisposable
                 }
                 break;
 
+            case "/settings/media-mode":
+                WriteJson(ctx, 200, new { mode = MediaModeStore.ToWireValue(_mediaModeStore.Get()) });
+                break;
+
+            case "/gsmtc/health":
+                {
+                    var health = GsmtcHealthTracker.GetSnapshot();
+                    WriteJson(ctx, 200, new
+                    {
+                        mode = MediaModeStore.ToWireValue(_mediaModeStore.Get()),
+                        isPermanentlyBroken = GsmtcHealthTracker.IsPermanentlyBroken,
+                        consecutiveFailures = health.ConsecutiveFailures,
+                        totalRestarts = health.TotalRestarts,
+                        isStuck = health.IsStuck,
+                        lastSuccessAt = health.LastSuccessAt,
+                    });
+                }
+                break;
+
             default:
                 WriteJson(ctx, 404, new { error = "not found", path });
                 break;
@@ -329,6 +356,13 @@ public sealed class BridgeHttpServer : IDisposable
                 }
                 break;
 
+            case "/gsmtc/repair":
+                {
+                    var result = await _gsmtcRecovery.RepairAsync(CancellationToken.None);
+                    WriteJson(ctx, 200, result);
+                }
+                break;
+
             default:
                 WriteJson(ctx, 404, new { error = "not found", path });
                 break;
@@ -344,26 +378,43 @@ public sealed class BridgeHttpServer : IDisposable
     /// </summary>
     private async Task<(object json, bool viaFallback)> BuildStatusJsonAsync()
     {
-        if (!GsmtcCircuitBreaker.ShouldSkip())
+        var mode = _mediaModeStore.Get();
+        if (MediaModePolicy.ShouldTryGsmtc(mode, GsmtcCircuitBreaker.ShouldSkip()))
         {
             var (status, timedOut, syncFault) = await WithTimeout(
                 _gsmtc.GetStatusAsync(CancellationToken.None), 1500, "HttpGetStatusAsync");
-            if (!timedOut)
+            if (!timedOut && status != null && !string.IsNullOrWhiteSpace(status.Title))
             {
                 GsmtcHealthTracker.RecordSuccess();
-                return (SerializeStatus(status, viaFallback: false), false);
+                return (SerializeStatus(status, false, true, mode, MediaMode.Gsmtc), false);
             }
-            GsmtcHealthTracker.RecordFailure("HttpGetStatusAsync", syncFault);
-            GsmtcCircuitBreaker.Open();
-            Log("GSMTC timeout → Win32 fallback (HTTP)");
+
+            if (timedOut)
+            {
+                GsmtcHealthTracker.RecordFailure("HttpGetStatusAsync", syncFault);
+                GsmtcCircuitBreaker.Open();
+            }
+
+            if (!MediaModePolicy.ShouldUseWin32(mode, gsmtcSucceeded: false))
+            {
+                var errorCode = syncFault != null ? "gsmtc_activation_failed"
+                    : timedOut ? "gsmtc_timeout" : "no_media_session";
+                return (SerializeStatus(status ?? MediaStatus.NoMedia(), false, false, mode, MediaMode.Gsmtc,
+                    new { code = errorCode, message = GsmtcErrorMessage(errorCode), stage = "probe" }), false);
+            }
+
+            Log("GSMTC unavailable → Win32 fallback (HTTP auto mode)");
         }
         else
         {
-            Log("GSMTC skipped (breaker open) → Win32 fast fallback (HTTP)");
+            Log(mode == MediaMode.Win32
+                ? "GSMTC bypassed by forced Win32 mode (HTTP)"
+                : "GSMTC skipped (breaker open) → Win32 fast fallback (HTTP auto mode)");
         }
 
         var fb = await _win32Fallback.GetFastStatusAsync(CancellationToken.None);
-        return (SerializeStatus(fb, viaFallback: true), true);
+        var viaFallback = mode == MediaMode.Auto;
+        return (SerializeStatus(fb, viaFallback, _win32Fallback.LastPlaybackKnown, mode, MediaMode.Win32), viaFallback);
     }
 
     private async Task<object> BuildStateResponseAsync(object statusJson, bool viaFallback)
@@ -641,7 +692,8 @@ public sealed class BridgeHttpServer : IDisposable
             _ => throw new ArgumentException($"Unknown command: {command}")
         };
 
-        if (!GsmtcCircuitBreaker.ShouldSkip())
+        var mode = _mediaModeStore.Get();
+        if (MediaModePolicy.ShouldTryGsmtc(mode, GsmtcCircuitBreaker.ShouldSkip()))
         {
             var (result, timedOut, syncFault) = await WithTimeout(
                 _gsmtc.SendCommandAsync(cmd, CancellationToken.None), 1500, "HttpSendCommand");
@@ -652,15 +704,26 @@ public sealed class BridgeHttpServer : IDisposable
             }
             GsmtcHealthTracker.RecordFailure("HttpSendCommand", syncFault);
             GsmtcCircuitBreaker.Open();
+            if (!MediaModePolicy.ShouldUseWin32(mode, gsmtcSucceeded: false))
+                return (false, syncFault?.Message ?? "GSMTC control timed out", false);
         }
 
+        if (mode == MediaMode.Gsmtc)
+            return (false, "GSMTC control unavailable", false);
+
         var fb = await _win32Fallback.SendCommandAsync(cmd, CancellationToken.None);
-        return (fb.Ok, fb.Error, true);
+        return (fb.Ok, fb.Error, mode == MediaMode.Auto);
     }
 
     // --- Helpers -----------------------------------------------------------
 
-    private static object SerializeStatus(MediaStatus status, bool viaFallback)
+    private static object SerializeStatus(
+        MediaStatus status,
+        bool viaFallback,
+        bool playbackKnown,
+        MediaMode requestedMode,
+        MediaMode activeMode,
+        object? mediaError = null)
     {
         bool hasCover = status.CoverUrl is not null
             || string.Equals(status.Source, "QQMusic", StringComparison.Ordinal);
@@ -675,11 +738,51 @@ public sealed class BridgeHttpServer : IDisposable
             coverUrl = (string?)null,
             hasCover,
             isPlaying = status.IsPlaying,
+            playbackKnown,
             positionMs = status.PositionMs,
             durationMs = status.DurationMs,
             updatedAt = status.UpdatedAt.ToString("o"),
             viaFallback,
+            requestedMode = MediaModeStore.ToWireValue(requestedMode),
+            activeMode = MediaModeStore.ToWireValue(activeMode),
+            mediaError,
         };
+    }
+
+    private static string GsmtcErrorMessage(string code) => code switch
+    {
+        "gsmtc_timeout" => "GSMTC request timed out",
+        "gsmtc_activation_failed" => "GSMTC could not be activated",
+        _ => "No current GSMTC media session",
+    };
+
+    private async Task HandlePut(HttpListenerContext ctx, string path)
+    {
+        if (path != "/settings/media-mode")
+        {
+            WriteJson(ctx, 404, new { error = "not found", path });
+            return;
+        }
+
+        using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding ?? Encoding.UTF8);
+        var body = await reader.ReadToEndAsync();
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            var value = document.RootElement.TryGetProperty("mode", out var element) ? element.GetString() : null;
+            if (!MediaModeStore.TryParse(value, out var mode))
+            {
+                WriteJson(ctx, 400, new { error = "invalid media mode", allowed = new[] { "auto", "win32", "gsmtc" } });
+                return;
+            }
+
+            _mediaModeStore.Set(mode);
+            WriteJson(ctx, 200, new { mode = MediaModeStore.ToWireValue(mode) });
+        }
+        catch (JsonException)
+        {
+            WriteJson(ctx, 400, new { error = "invalid JSON body" });
+        }
     }
 
     private static string ComputeSignature(string? title, string? artist, string? coverDataUrl, string? lrc)

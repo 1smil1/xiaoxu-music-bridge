@@ -156,6 +156,7 @@ window.addEventListener('message', (e) => {
         _bridgeFetchId: id,
         url: data.url,
         method: data.method,
+        body: data.body,
       });
       pending.set(id, (response) => {
         if (response && response.error) {

@@ -121,6 +121,17 @@ public static class GsmtcHealthTracker
             $"[{DateTime.Now:HH:mm:ss.fff}] GSMTC permanently-broken flag CLEARED — GSMTC will be retried\n");
     }
 
+    public static void ResetRecoveryState()
+    {
+        ClearPermanentlyBrokenFlag();
+        lock (_lock)
+        {
+            _consecutiveFailures = 0;
+            _restartTriggered = false;
+        }
+        try { if (File.Exists(CountFilePath)) File.Delete(CountFilePath); } catch { }
+    }
+
     /// <summary>Called from getStatus / getLyrics after a successful (non-timeout) response.</summary>
     public static void RecordSuccess()
     {
