@@ -60,34 +60,13 @@ Run("GSMTC repair succeeds only with usable current media", () =>
     Equal(true, new GsmtcProbeResult(true, "QQMusic", "Song", "Artist", 1000, 2000, null, null).IsSuccess);
 });
 
-Run("only auto mode records failures for automatic escalation", () =>
-{
-    Equal(true, MediaModePolicy.ShouldRecordGsmtcFailure(MediaMode.Auto));
-    Equal(false, MediaModePolicy.ShouldRecordGsmtcFailure(MediaMode.Gsmtc));
-    Equal(false, MediaModePolicy.ShouldRecordGsmtcFailure(MediaMode.Win32));
-});
-
-Run("repair restarts brokers only for timeout failures", () =>
-{
-    Equal(true, MediaModePolicy.ShouldRestartBroker("gsmtc_timeout"));
-    Equal(false, MediaModePolicy.ShouldRestartBroker("missing_dependency"));
-    Equal(false, MediaModePolicy.ShouldRestartBroker("no_media_session"));
-});
-
-Run("timeout wrapper captures exceptions thrown before a Task is returned", () =>
-{
-    var result = TaskTimeout.Run<int>(() => throw new FileNotFoundException("missing WinRT"), 100).GetAwaiter().GetResult();
-    Equal(true, result.TimedOut);
-    Equal(typeof(FileNotFoundException), result.SyncFault?.GetType());
-});
-
 if (failures.Count > 0)
 {
     Console.Error.WriteLine(string.Join(Environment.NewLine, failures));
     return 1;
 }
 
-Console.WriteLine("PASS: 11 media mode tests");
+Console.WriteLine("PASS: 8 media mode tests");
 return 0;
 
 void Run(string name, Action test)

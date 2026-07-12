@@ -52,7 +52,7 @@ namespace xiaoxu_music_bridge.Bridge;
 public sealed class BridgeHttpServer : IDisposable
 {
     private const int Port = 17888;
-    private const string HostVersion = "3.3.1";
+    private const string HostVersion = "3.3.0";
 
     // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
     // user's machine during frontend iteration without modifying this list.
@@ -382,14 +382,14 @@ public sealed class BridgeHttpServer : IDisposable
         if (MediaModePolicy.ShouldTryGsmtc(mode, GsmtcCircuitBreaker.ShouldSkip()))
         {
             var (status, timedOut, syncFault) = await WithTimeout(
-                () => _gsmtc.GetStatusAsync(CancellationToken.None), 1500, "HttpGetStatusAsync");
+                _gsmtc.GetStatusAsync(CancellationToken.None), 1500, "HttpGetStatusAsync");
             if (!timedOut && status != null && !string.IsNullOrWhiteSpace(status.Title))
             {
                 GsmtcHealthTracker.RecordSuccess();
                 return (SerializeStatus(status, false, true, mode, MediaMode.Gsmtc), false);
             }
 
-            if (timedOut && MediaModePolicy.ShouldRecordGsmtcFailure(mode))
+            if (timedOut)
             {
                 GsmtcHealthTracker.RecordFailure("HttpGetStatusAsync", syncFault);
                 GsmtcCircuitBreaker.Open();
@@ -696,16 +696,16 @@ public sealed class BridgeHttpServer : IDisposable
         if (MediaModePolicy.ShouldTryGsmtc(mode, GsmtcCircuitBreaker.ShouldSkip()))
         {
             var (result, timedOut, syncFault) = await WithTimeout(
-                () => _gsmtc.SendCommandAsync(cmd, CancellationToken.None), 1500, "HttpSendCommand");
+                _gsmtc.SendCommandAsync(cmd, CancellationToken.None), 1500, "HttpSendCommand");
             if (!timedOut)
             {
                 GsmtcHealthTracker.RecordSuccess();
                 return (result.Ok, result.Error, false);
             }
-            if (!MediaModePolicy.ShouldUseWin32(mode, gsmtcSucceeded: false))
-                return (false, syncFault?.Message ?? "GSMTC control timed out", false);
             GsmtcHealthTracker.RecordFailure("HttpSendCommand", syncFault);
             GsmtcCircuitBreaker.Open();
+            if (!MediaModePolicy.ShouldUseWin32(mode, gsmtcSucceeded: false))
+                return (false, syncFault?.Message ?? "GSMTC control timed out", false);
         }
 
         if (mode == MediaMode.Gsmtc)
@@ -816,21 +816,6 @@ public sealed class BridgeHttpServer : IDisposable
             Log($"{opName} sync fault: {ex.GetType().Name}: {ex.Message}");
             return (default!, true, ex);
         }
-    }
-
-    private static async Task<(T result, bool timedOut, Exception? syncFault)> WithTimeout<T>(Func<Task<T>> taskFactory, int ms, string opName)
-    {
-        Task<T> task;
-        try
-        {
-            task = taskFactory();
-        }
-        catch (Exception ex)
-        {
-            Log($"{opName} task creation fault: {ex.GetType().Name}: {ex.Message}");
-            return (default!, true, ex);
-        }
-        return await WithTimeout(task, ms, opName);
     }
 
     // v3.2.7 hotfix: camelCase naming so the frontend (which expects lowercase

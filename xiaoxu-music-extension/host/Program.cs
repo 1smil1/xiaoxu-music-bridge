@@ -394,22 +394,6 @@ static async Task<(T Result, bool TimedOut, Exception? SyncFault)> WithTimeout<T
     }
 }
 
-static async Task<(T Result, bool TimedOut, Exception? SyncFault)> WithTimeoutFactory<T>(Func<Task<T>> taskFactory, int timeoutMs, string opName)
-{
-    Task<T> task;
-    try
-    {
-        task = taskFactory();
-    }
-    catch (Exception ex)
-    {
-        LogPaths.SafeAppend(LogPaths.DebugLog,
-            $"[{DateTime.Now:HH:mm:ss}] {opName} task creation fault: {ex.GetType().Name}: {ex.Message}\n");
-        return (default!, true, ex);
-    }
-    return await WithTimeout(task, timeoutMs, opName);
-}
-
 static async Task<string> HandleGetStatus(
     WindowsMediaSessionService gsmtc,
     Win32MediaService fallback,
@@ -421,8 +405,8 @@ static async Task<string> HandleGetStatus(
     if (MediaModePolicy.ShouldTryGsmtc(mode, shouldSkipGsmtc()))
     {
         var statusStopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var (status, timedOut, syncFault) = await WithTimeoutFactory(
-            () => gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync");
+        var (status, timedOut, syncFault) = await WithTimeout(
+            gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync");
         statusStopwatch.Stop();
         if (!timedOut)
         {
@@ -456,13 +440,12 @@ static async Task<string> HandleGetStatus(
                     new { code = "no_media_session", message = "No current GSMTC media session", stage = "probe" });
             return SerializeStatus(status, false, true, mode, MediaMode.Gsmtc);
         }
+        // Timed out — log failure and open the circuit breaker for 30s
+        GsmtcHealthTracker.RecordFailure("GetStatusAsync", syncFault);
+        GsmtcCircuitBreaker.Open();
         if (mode == MediaMode.Gsmtc)
             return SerializeStatus(MediaStatus.NoMedia(), false, false, mode, MediaMode.Gsmtc,
                 new { code = syncFault != null ? "gsmtc_activation_failed" : "gsmtc_timeout", message = syncFault?.Message ?? "GSMTC request timed out", stage = "probe" });
-        // Only Auto owns automatic recovery. Forced GSMTC reports the error
-        // without restarting the host or changing the selected mode.
-        GsmtcHealthTracker.RecordFailure("GetStatusAsync", syncFault);
-        GsmtcCircuitBreaker.Open();
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleGetStatus GSMTC TIMEOUT → falling back to Win32 daemon title\n");
     }
@@ -533,8 +516,8 @@ static async Task<string> HandleControl(
 
     if (MediaModePolicy.ShouldTryGsmtc(mode, shouldSkipGsmtc()))
     {
-        var (result, timedOut, syncFault) = await WithTimeoutFactory(
-            () => gsmtc.SendCommandAsync(command, CancellationToken.None), 1500, "SendCommandAsync");
+        var (result, timedOut, syncFault) = await WithTimeout(
+            gsmtc.SendCommandAsync(command, CancellationToken.None), 1500, "SendCommandAsync");
         if (!timedOut)
         {
             GsmtcHealthTracker.RecordSuccess();
@@ -546,10 +529,10 @@ static async Task<string> HandleControl(
                 viaFallback = false
             });
         }
-        if (mode == MediaMode.Gsmtc)
-            return JsonSerializer.Serialize(new { type = "error", message = syncFault?.Message ?? "GSMTC control timed out" });
         GsmtcHealthTracker.RecordFailure("SendCommandAsync", syncFault);
         GsmtcCircuitBreaker.Open();
+        if (mode == MediaMode.Gsmtc)
+            return JsonSerializer.Serialize(new { type = "error", message = syncFault?.Message ?? "GSMTC control timed out" });
         LogPaths.SafeAppend(LogPaths.DebugLog,
             $"[{DateTime.Now:HH:mm:ss}] HandleControl GSMTC TIMEOUT control={commandStr} → media keys\n");
     }
@@ -581,8 +564,8 @@ static async Task<string> HandleGetLyrics(
 
     if (!shouldSkipGsmtc())
     {
-        var (s, statusTimedOut, syncFault) = await WithTimeoutFactory(
-            () => gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forLyrics)");
+        var (s, statusTimedOut, syncFault) = await WithTimeout(
+            gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forLyrics)");
         if (!statusTimedOut)
         {
             status = s;
@@ -866,8 +849,8 @@ static async Task<string> HandleGetCover(
 
     if (!shouldSkipGsmtcCover())
     {
-        var (cover, timedOut, coverSyncFault) = await WithTimeoutFactory(
-            () => gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GetCurrentCoverAsync");
+        var (cover, timedOut, coverSyncFault) = await WithTimeout(
+            gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GetCurrentCoverAsync");
         if (!timedOut)
         {
             GsmtcHealthTracker.RecordSuccess();
@@ -881,8 +864,8 @@ static async Task<string> HandleGetCover(
             // v3.2.5: ignore the sync fault from this internal call — we already
             // validated GSMTC works for cover, and any fault here would already
             // have been caught by the first WithTimeout above.
-            var (gsmtcStatus, statusTimedOut, _) = await WithTimeoutFactory(
-                () => gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forCover)");
+            var (gsmtcStatus, statusTimedOut, _) = await WithTimeout(
+                gsmtc.GetStatusAsync(CancellationToken.None), 1500, "GetStatusAsync(forCover)");
 
             if (!statusTimedOut)
             {
