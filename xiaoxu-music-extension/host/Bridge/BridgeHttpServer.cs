@@ -52,7 +52,8 @@ namespace xiaoxu_music_bridge.Bridge;
 public sealed class BridgeHttpServer : IDisposable
 {
     private const int Port = 17888;
-    private const string HostVersion = "3.3.0";
+    private const string HostVersion = "3.3.5";
+    private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
 
     // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
     // user's machine during frontend iteration without modifying this list.
@@ -276,7 +277,10 @@ public sealed class BridgeHttpServer : IDisposable
                 {
                     ok = true,
                     name = "xiaoxu-music-bridge",
-                    version = HostVersion
+                    version = HostVersion,
+                    pid = Environment.ProcessId,
+                    startedAt = _startedAt,
+                    uptimeSeconds = Math.Max(0, (long)(DateTimeOffset.Now - _startedAt).TotalSeconds)
                 });
                 break;
 
@@ -444,7 +448,7 @@ public sealed class BridgeHttpServer : IDisposable
         //
         // Cover (50-200KB image bytes) stays fire-and-forget — image
         // downloads are what made /state/current feel laggy in v3.2.6.
-        var coverCacheKey = $"{title}|{artist}|{viaFallback}";
+        var coverCacheKey = CoverIdentity.Create(title, artist);
 
         // Lyrics: shared cache first (Program.cs writes here on song change).
         LyricResponse? lyrics;
@@ -534,7 +538,7 @@ public sealed class BridgeHttpServer : IDisposable
 
         // Cache lookup (avoid hammering QQ/iTunes on every poll — 1Hz from
         // the dashboard means 60 hits/min without caching).
-        var key = $"{title}|{artist}|{viaFallback}";
+        var key = CoverIdentity.Create(title, artist);
         lock (_coverCacheLock)
         {
             if (_coverCacheKey == key) return _coverCacheValue;

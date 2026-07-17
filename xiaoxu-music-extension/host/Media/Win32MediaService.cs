@@ -103,6 +103,10 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
     private string _fastPlaybackKey = "";
     private bool _fastPlaybackAssumedPlaying = true;
     private DateTime? _fastPlaybackPauseCandidateSince;
+    private volatile bool _lastPlaybackKnown;
+    private DateTime _lastSessionProbeLogAt = DateTime.MinValue;
+
+    public bool LastPlaybackKnown => _lastPlaybackKnown;
 
     // Limits: anchor resets when the same anchor is trusted for too many polls.
     // Without this, a paused-but-heard-a-spike could "drift" past 0 again.
@@ -417,13 +421,108 @@ public sealed class Win32MediaService : IMediaSessionService, IDisposable
     private bool DetectIsPlayingFromBeat()
     {
         var beat = _beat;
-        if (beat == null) return true; // optimistic default during early startup
+        if (beat != null)
+        {
+            try
+            {
+                var (isPlaying, volume) = beat.GetIsPlayingAndVolume();
+                if (isPlaying || volume > 0.0001f)
+                {
+                    _lastPlaybackKnown = true;
+                    return true;
+                }
+
+                _lastPlaybackKnown = true;
+                return false;
+            }
+            catch
+            {
+                _lastPlaybackKnown = false;
+                return true;
+            }
+        }
+
+        var session = DetectQqMusicPlaybackFromAudioSession();
+        if (session.known)
+        {
+            _lastPlaybackKnown = true;
+            return session.isPlaying;
+        }
+
+        if (beat == null)
+        {
+            _lastPlaybackKnown = false;
+            return true; // optimistic default during early startup
+        }
+
+        _lastPlaybackKnown = false;
+        return false;
+    }
+
+    private (bool known, bool isPlaying, float peak, string? device, string? state) DetectQqMusicPlaybackFromAudioSession()
+    {
         try
         {
-            var (isPlaying, _) = beat.GetIsPlayingAndVolume();
-            return isPlaying;
+            var qqPids = new HashSet<int>(Process.GetProcessesByName(QQMusicProcessName).Select(p => p.Id));
+            if (qqPids.Count == 0) return (false, false, 0f, null, null);
+
+            using var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+            var devices = enumerator.EnumerateAudioEndPoints(NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.DeviceState.Active);
+            bool sawSession = false;
+            float maxPeak = 0f;
+            string? bestDevice = null;
+            string? bestState = null;
+            foreach (var device in devices)
+            {
+                try
+                {
+                    var sessions = device.AudioSessionManager.Sessions;
+                    for (int i = 0; i < sessions.Count; i++)
+                    {
+                        var session = sessions[i];
+                        if (!qqPids.Contains((int)session.GetProcessID)) continue;
+                        sawSession = true;
+                        var peak = session.AudioMeterInformation.MasterPeakValue;
+                        if (peak >= maxPeak)
+                        {
+                            maxPeak = peak;
+                            bestDevice = device.FriendlyName;
+                            bestState = session.State.ToString();
+                        }
+                        if (session.State == NAudio.CoreAudioApi.Interfaces.AudioSessionState.AudioSessionStateActive)
+                        {
+                            LogSessionProbe(true, true, peak, device.FriendlyName, session.State.ToString());
+                            return (true, true, peak, device.FriendlyName, session.State.ToString());
+                        }
+                    }
+                }
+                finally
+                {
+                    device.Dispose();
+                }
+            }
+
+            if (sawSession)
+            {
+                LogSessionProbe(true, false, maxPeak, bestDevice, bestState);
+                return (true, false, maxPeak, bestDevice, bestState);
+            }
         }
-        catch { return true; }
+        catch (Exception ex)
+        {
+            LogPaths.SafeAppend(LogPaths.DebugLog,
+                $"[{DateTime.Now:HH:mm:ss.fff}] [Win32AudioSession] probe failed: {ex.GetType().Name}: {ex.Message}\n");
+        }
+        return (false, false, 0f, null, null);
+    }
+
+    private void LogSessionProbe(bool known, bool isPlaying, float peak, string? device, string? state)
+    {
+        var now = DateTime.Now;
+        if (now - _lastSessionProbeLogAt < TimeSpan.FromSeconds(3)) return;
+        _lastSessionProbeLogAt = now;
+        LogPaths.SafeAppend(LogPaths.DebugLog,
+            $"[{now:HH:mm:ss.fff}] [Win32AudioSession] known={known} playing={isPlaying} peak={peak:F4} state={state} device='{device}'\n");
     }
 
     private bool SmoothFastPlaybackState(string songKey, bool rawBeatPlaying)

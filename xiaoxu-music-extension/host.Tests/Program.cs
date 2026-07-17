@@ -60,13 +60,36 @@ Run("GSMTC repair succeeds only with usable current media", () =>
     Equal(true, new GsmtcProbeResult(true, "QQMusic", "Song", "Artist", 1000, 2000, null, null).IsSuccess);
 });
 
+Run("native messaging EOF exits the host", () =>
+{
+    Equal(false, NativeHostLifetime.ShouldContinueAfterInputClosed());
+});
+
+Run("debug log rotates when the next write exceeds the size limit", () =>
+{
+    using var temp = new TempDirectory();
+    Directory.CreateDirectory(temp.Path);
+    var path = System.IO.Path.Combine(temp.Path, "debug.log");
+    File.WriteAllText(path, "12345678");
+
+    LogPaths.SafeAppend(path, "abc", maxBytes: 10);
+
+    Equal("abc", File.ReadAllText(path));
+    Equal("12345678", File.ReadAllText(path + ".1"));
+});
+
+Run("cover identity is song based and independent of media mode", () =>
+{
+    Equal("underwater|权恩妃 (권은비)", CoverIdentity.Create("  Underwater ", "权恩妃  (권은비)"));
+});
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine(string.Join(Environment.NewLine, failures));
     return 1;
 }
 
-Console.WriteLine("PASS: 8 media mode tests");
+Console.WriteLine("PASS: 11 host policy tests");
 return 0;
 
 void Run(string name, Action test)

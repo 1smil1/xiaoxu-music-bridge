@@ -1,4 +1,6 @@
 // background.js — Chrome extension service worker
+importScripts('reconnect-policy.js');
+importScripts('bridge-binary.js');
 // Connects to native messaging host and relays messages between content script and host.
 //
 // Architecture:
@@ -28,6 +30,27 @@ const BEAT_RESUBSCRIBE_INTERVAL = 20000; // 20s, before host's 30s auto-unsubscr
 let beatSubscriptionActive = false;
 let stateCoverKey = null;
 let stateCoverDataUrl = null;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+
+function cancelReconnect() {
+  if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+}
+
+function scheduleHostReconnect() {
+  if (reconnectTimer !== null || activePorts.size === 0) return;
+  const delay = self.XiaoxuReconnectPolicy.reconnectDelayMs(reconnectAttempt);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectAttempt += 1;
+    if (activePorts.size === 0) return;
+    try { ensureBeatSubscribed(); } catch (e) {
+      console.warn('[xiaoxu-music] post-disconnect resubscribe failed:', e.message);
+      scheduleHostReconnect();
+    }
+  }, delay);
+}
 
 function ensureBeatSubscribed() {
   if (beatSubscriptionActive && host) return;
@@ -65,23 +88,23 @@ function connectHost() {
       'extension ID:', chrome.runtime.id);
     host = null;
     beatSubscriptionActive = false;
-    for (const [id, { reject }] of pending) {
+    for (const [id, { reject, timeout }] of pending) {
       pending.delete(id);
+      clearTimeout(timeout);
       reject(new Error(err?.message || 'Native host disconnected'));
     }
-    if (activePorts.size > 0) {
-      setTimeout(() => { try { ensureBeatSubscribed(); } catch (e) {
-        console.warn('[xiaoxu-music] post-disconnect resubscribe failed:', e.message);
-      } }, 0);
-    }
+    scheduleHostReconnect();
   });
 
   host.onMessage.addListener((message) => {
+    reconnectAttempt = 0;
+    cancelReconnect();
     // Route response messages to pending requests.
     const id = message._id;
     if (id !== undefined && pending.has(id)) {
-      const { resolve } = pending.get(id);
+      const { resolve, timeout } = pending.get(id);
       pending.delete(id);
+      clearTimeout(timeout);
       resolve(message);
       return;
     }
@@ -119,15 +142,20 @@ function sendToHost(message, timeoutMs = 10000) {
     }
 
     const id = ++requestId;
-    pending.set(id, { resolve, reject });
-    h.postMessage({ ...message, _id: id });
-
-    setTimeout(() => {
+    const timeout = setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
         reject(new Error('Native host response timeout'));
       }
     }, timeoutMs);
+    pending.set(id, { resolve, reject, timeout });
+    try {
+      h.postMessage({ ...message, _id: id });
+    } catch (error) {
+      clearTimeout(timeout);
+      pending.delete(id);
+      reject(error);
+    }
   });
 }
 
@@ -163,14 +191,30 @@ async function handleBridgeRequest(port, fetchId, message) {
   }
 
   if (pathname === '/cover/current') {
-    chrome.storage.session.get('coverDataUrl', (result) => {
-      reply({ ok: true, status: 200, data: { type: 'cover', dataUrl: result.coverDataUrl || null } });
-    });
+    try {
+      const directUrl = new URL(url);
+      directUrl.hostname = 'localhost';
+      const response = await fetch(directUrl.toString(), {
+        cache: 'no-store',
+        headers: { Accept: 'image/*' },
+      });
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      reply({
+        ok: response.ok,
+        status: response.status,
+        data: self.XiaoxuBridgeBinary.encodeBridgeBinary(
+          bytes,
+          response.headers.get('content-type') || 'application/octet-stream',
+        ),
+      });
+    } catch (error) {
+      reply({ ok: false, status: 503, data: { error: error.message } });
+    }
     return;
   }
 
   if (pathname === '/health') {
-    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.3.0' } });
+    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.3.5' } });
     return;
   }
 
@@ -203,7 +247,7 @@ async function handleBridgeRequest(port, fetchId, message) {
     };
 
     let coverDataUrl = null;
-    const coverKey = [statusObj.source, statusObj.title, statusObj.artist, statusObj.album]
+    const coverKey = [statusObj.title, statusObj.artist]
       .map((x) => (x == null ? '' : String(x))).join('|');
     // Do not synchronously call getCover from /state/current. Native Messaging is
     // FIFO; a slow cover lookup blocks the next getState and makes lyric changes
@@ -315,6 +359,7 @@ chrome.runtime.onConnect.addListener((port) => {
       try { host.postMessage({ type: 'unsubscribeBeat' }); } catch (e) {}
       beatSubscriptionActive = false;
     }
+    if (activePorts.size === 0) cancelReconnect();
   });
 
   port.onMessage.addListener((message) => {

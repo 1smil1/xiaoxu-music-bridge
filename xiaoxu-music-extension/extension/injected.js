@@ -24,11 +24,24 @@
             if (e.data.error) {
               reject(new TypeError(e.data.error));
             } else {
-              const respBody = typeof e.data.data === 'string' ? e.data.data : JSON.stringify(e.data.data);
+              const binaryPayload = e.data.data && e.data.data.__bridgeBinary === true
+                ? e.data.data
+                : null;
+              let respBody;
+              let contentType = 'application/json';
+              if (binaryPayload) {
+                const binary = atob(binaryPayload.base64 || '');
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+                respBody = bytes;
+                contentType = binaryPayload.contentType || 'application/octet-stream';
+              } else {
+                respBody = typeof e.data.data === 'string' ? e.data.data : JSON.stringify(e.data.data);
+              }
               const respStatus = e.data.status || 200;
               resolve(new Response(respBody, {
                 status: respStatus,
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 'Content-Type': contentType }
               }));
             }
           }

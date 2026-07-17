@@ -9,5 +9,8 @@
     <Compile Include="../host/Common/MediaModeStore.cs" Link="MediaModeStore.cs" />
     <Compile Include="../host/Common/MediaModePolicy.cs" Link="MediaModePolicy.cs" />
     <Compile Include="../host/Common/GsmtcProbeResult.cs" Link="GsmtcProbeResult.cs" />
+    <Compile Include="../host/Common/LogPaths.cs" Link="LogPaths.cs" />
+    <Compile Include="../host/Common/NativeHostLifetime.cs" Link="NativeHostLifetime.cs" />
+    <Compile Include="../host/Common/CoverIdentity.cs" Link="CoverIdentity.cs" />
   </ItemGroup>
 </Project>

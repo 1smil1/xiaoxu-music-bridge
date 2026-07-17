@@ -125,8 +125,7 @@ public sealed class QqMusicWindowScanService : IDisposable
         _staThread = new Thread(StaThreadMain)
         {
             IsBackground = true,
-            Name = "QQMusicWindowScan-STA",
-            IsBackgroundSpecified = true
+            Name = "QQMusicWindowScan-STA"
         };
         _staThread.SetApartmentState(ApartmentState.STA);
         _staThread.Start();
@@ -473,7 +472,12 @@ public sealed class QqMusicWindowScanService : IDisposable
 
         WNDCLASSEX wc = new WNDCLASSEX();
         wc.cbSize = (uint)Marshal.SizeOf<WNDCLASSEX>();
-        wc.lpfnWndProc = WndProc;
+        // Keep the WndProc delegate rooted for the lifetime of the class to
+        // prevent the GC from collecting it (which would make the function
+        // pointer go stale). GetFunctionPointerForDelegate is the only safe
+        // way to convert a managed method to an unmanaged IntPtr.
+        _wndProcDelegate = WndProc;
+        wc.lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate);
         wc.hInstance = GetModuleHandle(null);
         wc.lpszClassName = className;
         if (RegisterClassEx(ref wc) == 0)
@@ -521,7 +525,7 @@ public sealed class QqMusicWindowScanService : IDisposable
             if (!PeekMessage(out var msg, IntPtr.Zero, 0, 0, 1 /* PM_NOREMOVE */))
             {
                 // No messages waiting — sleep a little.
-                MsgWaitForMultipleObjects(0, IntPtr.Zero, 0, Math.Min(20, remaining), 0x01 /* QS_POSTMESSAGE */);
+                MsgWaitForMultipleObjects(0, IntPtr.Zero, false, (uint)Math.Min(20, remaining), 0x01u /* QS_POSTMESSAGE */);
                 continue;
             }
             TranslateMessage(ref msg);
@@ -541,7 +545,7 @@ public sealed class QqMusicWindowScanService : IDisposable
                 if (cds.cbData > 0 && cds.lpData != IntPtr.Zero)
                 {
                     data = new byte[cds.cbData];
-                    Marshal.Copy(cds.lpData, data, 0, cds.cbData);
+                    Marshal.Copy(cds.lpData, data, 0, (int)cds.cbData);
                 }
                 string preview = data != null ? TruncateForLog(Encoding.UTF8.GetString(data), 160) : "(empty)";
                 _replyQueue.TryAdd(new CapturedReply(data, preview));
@@ -659,6 +663,13 @@ public sealed class QqMusicWindowScanService : IDisposable
     }
 
     // --- P/Invoke ---
+
+    // Rooted WndProc delegate — must live for the lifetime of the class so
+    // the function pointer passed to RegisterClassEx doesn't dangle.
+    private WndProcDelegate? _wndProcDelegate;
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
