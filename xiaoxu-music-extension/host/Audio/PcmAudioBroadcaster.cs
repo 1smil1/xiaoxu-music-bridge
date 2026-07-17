@@ -12,6 +12,7 @@ public enum PcmAudioFrameFlags : byte
 {
     None = 0,
     Discontinuity = 1,
+    KeepAlive = 2,
 }
 
 public readonly record struct AudioClockSnapshot(
@@ -224,6 +225,33 @@ public sealed class PcmAudioBroadcaster : IDisposable
         }
     }
 
+    internal async ValueTask<byte[]?> ReadAsync(
+        PcmAudioSubscription subscription,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            if (TryRead(subscription, out var packet)) return packet;
+            if (subscription.IsEnded || !IsActive(subscription))
+                throw new EndOfStreamException("PCM audio stream ended");
+            if (!await subscription.WaitForDataAsync(timeout, cancellationToken).ConfigureAwait(false))
+                return null;
+        }
+    }
+
+    public static byte[] BuildKeepAlivePacket(AudioClockSnapshot clock)
+    {
+        var packet = new byte[HeaderSize];
+        "XPCM"u8.CopyTo(packet);
+        packet[4] = 1;
+        packet[5] = (byte)PcmAudioFrameFlags.KeepAlive;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(8, 4), checked((uint)Math.Max(0, clock.SampleRate)));
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(16, 8), clock.SampleIndex);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(24, 8), checked((ulong)Math.Max(0, clock.MonotonicMs * 1000)));
+        return packet;
+    }
+
     private bool IsActive(PcmAudioSubscription subscription)
     {
         lock (_gate) return ReferenceEquals(subscription, _subscriber);
@@ -337,6 +365,9 @@ public sealed class PcmAudioSubscription : IDisposable
     internal Task WaitForDataAsync(CancellationToken cancellationToken) =>
         _dataAvailable.WaitAsync(cancellationToken);
 
+    internal Task<bool> WaitForDataAsync(TimeSpan timeout, CancellationToken cancellationToken) =>
+        _dataAvailable.WaitAsync(timeout, cancellationToken);
+
     internal void SignalDataAvailable()
     {
         if (_dataAvailable.CurrentCount == 0)
@@ -363,6 +394,15 @@ public sealed class PcmAudioSubscription : IDisposable
         var owner = Volatile.Read(ref _owner)
             ?? throw new ObjectDisposedException(nameof(PcmAudioSubscription));
         return owner.ReadAsync(this, cancellationToken);
+    }
+
+    public ValueTask<byte[]?> ReadAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        var owner = Volatile.Read(ref _owner)
+            ?? throw new ObjectDisposedException(nameof(PcmAudioSubscription));
+        return owner.ReadAsync(this, timeout, cancellationToken);
     }
 
     public void Dispose()

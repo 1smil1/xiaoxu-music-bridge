@@ -15,9 +15,21 @@ internal static class PcmAudioBroadcasterTests
         DropsOldFramesAndMarksDiscontinuity();
         FormatChangeMarksNextFrameAsDiscontinuous();
         DoesNotBufferWithoutSubscriber();
+        BuildsProtocolKeepalive();
         ValidatesStreamOrigins();
         RejectsUnavailableOrNonFloatCapture();
         SilentBeatResponseIncludesAudioClock();
+    }
+
+    private static void BuildsProtocolKeepalive()
+    {
+        var packet = PcmAudioBroadcaster.BuildKeepAlivePacket(
+            new AudioClockSnapshot(480, 48_000, 25, 0));
+        Equal(32, packet.Length);
+        Equal("XPCM", System.Text.Encoding.ASCII.GetString(packet, 0, 4));
+        Equal((byte)PcmAudioFrameFlags.KeepAlive, packet[5]);
+        Equal((uint)0, BinaryPrimitives.ReadUInt32LittleEndian(packet.AsSpan(12, 4)));
+        Equal((ulong)480, BinaryPrimitives.ReadUInt64LittleEndian(packet.AsSpan(16, 8)));
     }
 
     internal static async Task ReadAsyncEndsWhenStreamEnds()

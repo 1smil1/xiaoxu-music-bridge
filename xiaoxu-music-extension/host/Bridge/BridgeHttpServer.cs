@@ -738,7 +738,10 @@ public sealed class BridgeHttpServer : IDisposable
             {
                 while (_running && !_stopCts.IsCancellationRequested)
                 {
-                    var packet = await subscription.ReadAsync(_stopCts.Token);
+                    var packet = await subscription.ReadAsync(
+                        TimeSpan.FromSeconds(1),
+                        _stopCts.Token)
+                        ?? PcmAudioBroadcaster.BuildKeepAlivePacket(svc.GetAudioClock());
                     await ctx.Response.OutputStream.WriteAsync(packet, _stopCts.Token);
                     await ctx.Response.OutputStream.FlushAsync(_stopCts.Token);
                 }
