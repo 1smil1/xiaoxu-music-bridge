@@ -116,6 +116,14 @@ try {
 } catch {
     Write-Host "  -> WARN: Could not sync to Chrome User Data JSON: $_" -ForegroundColor Yellow
 }
+
+# Run in the interactive user session so Lively keeps working after Chrome exits.
+$runPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+if (!(Test-Path $runPath)) { New-Item -Path $runPath -Force | Out-Null }
+Set-ItemProperty -Path $runPath -Name "xiaoxu-music-host" -Value "`"$exePath`" --server" -Type String
+Start-Process -FilePath $exePath -ArgumentList "--server" -WorkingDirectory $InstallDir -WindowStyle Hidden
+Write-Host "  -> Persistent Host started and registered for user login" -ForegroundColor Green
+
 # ── 5. Copy Chrome extension ──────────────────────────────────────
 Write-Host "[4/5] Copying Chrome extension..." -ForegroundColor Yellow
 
@@ -139,6 +147,6 @@ Write-Host "  4. The extension ID should be: $ExtensionId" -ForegroundColor Whit
 Write-Host "     (fixed via manifest.json key field — same on every PC)" -ForegroundColor Gray
 Write-Host "  5. Restart Chrome" -ForegroundColor White
 Write-Host ""
-Write-Host "After that, just open xiaoxu.xin and the music bridge works automatically!" -ForegroundColor Green
+Write-Host "The Host now serves Chrome and Lively independently in this user session." -ForegroundColor Green
 Write-Host ""
 Write-Host "Files installed to: $InstallDir" -ForegroundColor Gray

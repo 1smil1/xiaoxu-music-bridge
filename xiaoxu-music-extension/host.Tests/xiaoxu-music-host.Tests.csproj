@@ -12,5 +12,7 @@
     <Compile Include="../host/Common/LogPaths.cs" Link="LogPaths.cs" />
     <Compile Include="../host/Common/NativeHostLifetime.cs" Link="NativeHostLifetime.cs" />
     <Compile Include="../host/Common/CoverIdentity.cs" Link="CoverIdentity.cs" />
+    <Compile Include="../host/Common/HostLaunchPolicy.cs" Link="HostLaunchPolicy.cs" />
+    <Compile Include="../host/Common/BeatHttpResponsePolicy.cs" Link="BeatHttpResponsePolicy.cs" />
   </ItemGroup>
 </Project>

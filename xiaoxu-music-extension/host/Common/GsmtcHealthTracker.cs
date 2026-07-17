@@ -499,9 +499,16 @@ internal static class SelfRestart
             };
 
             string[] originalArgs = Environment.GetCommandLineArgs();
-            for (int i = 1; i < originalArgs.Length; i++)
+            var isServer = originalArgs.Skip(1).Any(arg =>
+                string.Equals(arg, "--server", StringComparison.OrdinalIgnoreCase));
+            if (isServer)
             {
-                psi.ArgumentList.Add(originalArgs[i]);
+                psi.Arguments = HostLaunchPolicy.BuildServerArguments(Environment.ProcessId);
+            }
+            else
+            {
+                for (int i = 1; i < originalArgs.Length; i++)
+                    psi.ArgumentList.Add(originalArgs[i]);
             }
 
             var newProc = Process.Start(psi);

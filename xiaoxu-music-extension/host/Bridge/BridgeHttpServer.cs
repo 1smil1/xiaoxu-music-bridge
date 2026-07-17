@@ -52,7 +52,7 @@ namespace xiaoxu_music_bridge.Bridge;
 public sealed class BridgeHttpServer : IDisposable
 {
     private const int Port = 17888;
-    private const string HostVersion = "3.3.5";
+    private const string HostVersion = "3.4.0";
     private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
 
     // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
@@ -106,6 +106,8 @@ public sealed class BridgeHttpServer : IDisposable
     private HttpListener? _listener;
     private Thread? _thread;
     private volatile bool _running;
+
+    public bool IsRunning => _running;
 
     public BridgeHttpServer(
         WindowsMediaSessionService gsmtc,
@@ -301,7 +303,7 @@ public sealed class BridgeHttpServer : IDisposable
 
             case "/beat/current":
                 {
-                    WriteJson(ctx, 200, BuildBeatJson());
+                    WriteRawJson(ctx, 200, BuildBeatJson());
                 }
                 break;
 
@@ -666,22 +668,11 @@ public sealed class BridgeHttpServer : IDisposable
 
     // --- Beat --------------------------------------------------------------
 
-    private object BuildBeatJson()
+    private string BuildBeatJson()
     {
         AudioBeatService? svc;
         lock (_beatLock) svc = _beatService;
-        if (svc == null)
-        {
-            return new { bass = 0.0, volume = 0.0, pulse = 0.0, glow = 0.0 };
-        }
-        var (bass, volume, pulse, glow) = svc.GetSnapshot();
-        return new
-        {
-            bass = Math.Round(bass, 3),
-            volume = Math.Round(volume, 3),
-            pulse = Math.Round(pulse, 3),
-            glow = Math.Round(glow, 3),
-        };
+        return BeatHttpResponsePolicy.SelectJson(svc?.GetFullSnapshotJson());
     }
 
     // --- Control -----------------------------------------------------------
@@ -848,6 +839,22 @@ public sealed class BridgeHttpServer : IDisposable
         finally
         {
             try { ctx.Response.Close(); } catch { /* swallow */ }
+        }
+    }
+
+    private static void WriteRawJson(HttpListenerContext ctx, int status, string json)
+    {
+        var bytes = Encoding.UTF8.GetBytes(json);
+        ctx.Response.StatusCode = status;
+        ctx.Response.ContentType = "application/json; charset=utf-8";
+        ctx.Response.ContentLength64 = bytes.Length;
+        try
+        {
+            ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+        }
+        finally
+        {
+            try { ctx.Response.Close(); } catch { }
         }
     }
 

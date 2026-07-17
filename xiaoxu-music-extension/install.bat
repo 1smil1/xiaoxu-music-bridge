@@ -79,6 +79,19 @@ reg add "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve
 echo  [4/5] OK (HKCU + HKLM)
 echo.
 
+echo  [4a/5] Registering persistent Host at user login ...
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "xiaoxu-music-host" /t REG_SZ /d "\"%INSTALL_DIR%\xiaoxu-music-host.exe\" --server" /f >nul 2>&1
+if %errorlevel% neq 0 (
+    echo  [4a/5] FAILED - could not write HKCU Run entry
+    echo.
+    pause
+    exit /b 1
+)
+start "" /B "%INSTALL_DIR%\xiaoxu-music-host.exe" --server
+timeout /t 2 /nobreak >nul
+echo  [4a/5] OK
+echo.
+
 echo  [4b/5] Syncing Chrome User Data JSON ...
 rem Some older installs left a stale JSON in Chrome User Data NativeMessagingHosts
 rem directory with the WRONG extension ID. Chrome does not always re-read HKCU on

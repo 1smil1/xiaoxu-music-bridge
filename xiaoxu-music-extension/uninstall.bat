@@ -29,6 +29,7 @@ taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
 :: Delete registry (both HKCU and HKLM)
 reg delete "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /f >nul 2>&1
 reg delete "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /f >nul 2>&1
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "xiaoxu-music-host" /f >nul 2>&1
 echo  [OK] 注册表已清除 (HKCU + HKLM)
 
 :: Delete stale JSON in Chrome User Data NativeMessagingHosts directory

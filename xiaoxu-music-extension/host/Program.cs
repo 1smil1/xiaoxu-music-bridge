@@ -28,6 +28,28 @@ if (args.Contains("--restart-gsmtc-services", StringComparer.OrdinalIgnoreCase))
 
 try
 {
+var launchMode = HostLaunchPolicy.Resolve(args);
+if (launchMode == HostLaunchMode.NativeMessaging)
+{
+    await RunNativeLauncherAsync();
+    return;
+}
+
+var waitForPid = HostLaunchPolicy.GetWaitForPid(args);
+if (waitForPid is null && await IsServerHealthyAsync()) return;
+if (waitForPid is > 0)
+{
+    try
+    {
+        using var previous = System.Diagnostics.Process.GetProcessById(waitForPid.Value);
+        previous.WaitForExit(15000);
+    }
+    catch (ArgumentException) { }
+}
+
+using var serverMutex = new Mutex(initiallyOwned: true, HostLaunchPolicy.ServerMutexName, out var ownsServerMutex);
+if (!ownsServerMutex) return;
+
 var hostStartedAt = DateTimeOffset.Now;
 var hostPid = Environment.ProcessId;
 // Log IMMEDIATELY — before any service initialization
@@ -134,6 +156,8 @@ var bridgeHttp = new BridgeHttpServer(gsmtcService, win32Fallback);
 bridgeHttp.SetLyricService(lyricService);
 bridgeHttp.SetCoverLookupServices(coverLookup, itunesCoverLookup);
 bridgeHttp.Start();
+if (!bridgeHttp.IsRunning)
+    throw new InvalidOperationException("Bridge HTTP server could not bind localhost:17888");
 LogPaths.SafeAppend(LogPaths.DebugLog,
     $"[{DateTime.Now:HH:mm:ss}] BridgeHttpServer STARTED on http://127.0.0.1:17888/\n");
 
@@ -193,6 +217,10 @@ if (beatService is null)
     LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] AudioBeatService STARTED at host startup\n");
 }
+
+// The persistent server owns HTTP, media and audio services independently of
+// Chrome. Native Messaging invocations return above after ensuring this process.
+await Task.Delay(Timeout.Infinite);
 
 while (true)
 {
@@ -585,6 +613,84 @@ static async Task<string> HandleGetLyrics(
 
     var lyrics = await ResolveLyricsForStatus(status, lyricService, viaFallback);
     return JsonSerializer.Serialize(BuildLyricsResponse(lyrics, viaFallback));
+}
+
+static async Task RunNativeLauncherAsync()
+{
+    var stdin = Console.OpenStandardInput();
+    var stdout = Console.OpenStandardOutput();
+    var lengthBuffer = new byte[4];
+    if (!FillBuffer(stdin, lengthBuffer, lengthBuffer.Length)) return;
+
+    var messageLength = BinaryPrimitives.ReadUInt32LittleEndian(lengthBuffer);
+    if (messageLength == 0 || messageLength > 1024 * 1024) return;
+    var body = new byte[messageLength];
+    if (!FillBuffer(stdin, body, body.Length)) return;
+
+    long? requestId = null;
+    try
+    {
+        using var request = JsonDocument.Parse(body);
+        if (request.RootElement.TryGetProperty("_id", out var idElement))
+            requestId = idElement.GetInt64();
+    }
+    catch (JsonException) { }
+
+    var result = await EnsureServerAsync();
+    var response = new Dictionary<string, object?>
+    {
+        ["type"] = "ensureServer",
+        ["ok"] = result.ok,
+        ["error"] = result.error,
+    };
+    if (requestId.HasValue) response["_id"] = requestId.Value;
+    WriteMessage(stdout, JsonSerializer.Serialize(response));
+}
+
+static async Task<(bool ok, string? error)> EnsureServerAsync()
+{
+    if (await IsServerHealthyAsync()) return (true, null);
+
+    var exePath = Environment.ProcessPath;
+    if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+        return (false, "Cannot locate xiaoxu-music-host.exe");
+
+    try
+    {
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = exePath,
+            Arguments = HostLaunchPolicy.BuildServerArguments(null),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = AppContext.BaseDirectory,
+        });
+    }
+    catch (Exception ex)
+    {
+        return (false, ex.Message);
+    }
+
+    for (var attempt = 0; attempt < 25; attempt++)
+    {
+        await Task.Delay(200);
+        if (await IsServerHealthyAsync()) return (true, null);
+    }
+    return (false, "Server did not become healthy within 5 seconds");
+}
+
+static async Task<bool> IsServerHealthyAsync()
+{
+    try
+    {
+        using var client = new HttpClient { Timeout = TimeSpan.FromMilliseconds(500) };
+        using var response = await client.GetAsync("http://localhost:17888/health");
+        return response.IsSuccessStatusCode;
+    }
+    catch
+    {
+        return false;
+    }
 }
 
 static async Task<string> HandleGetState(

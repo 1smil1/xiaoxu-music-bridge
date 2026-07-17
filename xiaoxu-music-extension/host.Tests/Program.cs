@@ -65,6 +65,32 @@ Run("native messaging EOF exits the host", () =>
     Equal(false, NativeHostLifetime.ShouldContinueAfterInputClosed());
 });
 
+Run("host launch mode distinguishes persistent server from native messaging", () =>
+{
+    Equal(HostLaunchMode.Server, HostLaunchPolicy.Resolve(new[] { "--server" }));
+    Equal(HostLaunchMode.NativeMessaging, HostLaunchPolicy.Resolve(new[] { "chrome-extension://fixed-id/" }));
+});
+
+Run("server replacement waits for the previous process", () =>
+{
+    Equal("--server --wait-for-pid 4321", HostLaunchPolicy.BuildServerArguments(4321));
+    Equal("--server", HostLaunchPolicy.BuildServerArguments(null));
+});
+
+Run("beat HTTP response preserves the complete v3 audio frame", () =>
+{
+    const string frame = "{\"type\":\"beat\",\"bass\":0.2,\"bands\":{\"sub\":0.1},\"features\":{\"rms\":0.02},\"onsets\":{},\"rhythm\":{},\"state\":{},\"ts\":123}";
+    Equal(frame, BeatHttpResponsePolicy.SelectJson(frame));
+});
+
+Run("beat HTTP response has a compatible silent frame before capture starts", () =>
+{
+    var json = BeatHttpResponsePolicy.SelectJson(null);
+    Equal(true, json.Contains("\"bands\""));
+    Equal(true, json.Contains("\"state\""));
+    Equal(true, json.Contains("\"ts\""));
+});
+
 Run("debug log rotates when the next write exceeds the size limit", () =>
 {
     using var temp = new TempDirectory();
@@ -89,7 +115,7 @@ if (failures.Count > 0)
     return 1;
 }
 
-Console.WriteLine("PASS: 11 host policy tests");
+Console.WriteLine("PASS: 15 host policy tests");
 return 0;
 
 void Run(string name, Action test)

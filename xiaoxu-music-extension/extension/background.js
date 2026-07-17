@@ -1,374 +1,63 @@
-// background.js — Chrome extension service worker
-importScripts('reconnect-policy.js');
-importScripts('bridge-binary.js');
-// Connects to native messaging host and relays messages between content script and host.
-//
-// Architecture:
-//   - One chrome.runtime.connectNative = one host.exe process (multiplexed)
-//   - One long-lived "xiaoxu-bridge" port per content script keeps the
-//     MV3 service worker alive indefinitely — fixes the 30s-death-then-503 cycle
-//     where Chrome kills idle workers, then content.js's sendMessage port closes
-//     before a response comes back.
-//
-// The port carries:
-//   - bridgeRequest (page fetch → host)  and bridgeResponse (host → page)
-//   - BEAT_UPDATE push from host → all open ports (broadcast)
+// Service worker: starts the persistent local server when xiaoxu.xin opens.
+// All media, lyric, cover, control and audio-frame traffic goes directly from
+// the page to http://localhost:17888.
 
-const HOST_NAME = 'xiaoxu_music_host';
-let host = null;             // single long-lived native messaging port
-let requestId = 0;
-const pending = new Map();   // host request id → { resolve, reject } (raw host response)
+importScripts('host-bootstrap.js');
 
-const activePorts = new Set();  // all open "xiaoxu-bridge" ports
+const NATIVE_HOST = 'xiaoxu_music_host';
+const HEALTH_URL = 'http://localhost:17888/health';
+const activePorts = new Set();
+let healthTimer = null;
 
-// Beat subscription is bound to port lifetime:
-//   - first port connects → start AudioBeatService
-//   - last port disconnects → stop AudioBeatService
-//   - host reconnects (after disconnect) → re-subscribe if any port is open
-let beatLastSubscribe = 0;
-const BEAT_RESUBSCRIBE_INTERVAL = 20000; // 20s, before host's 30s auto-unsubscribe
-let beatSubscriptionActive = false;
-let stateCoverKey = null;
-let stateCoverDataUrl = null;
-let reconnectTimer = null;
-let reconnectAttempt = 0;
-
-function cancelReconnect() {
-  if (reconnectTimer !== null) clearTimeout(reconnectTimer);
-  reconnectTimer = null;
-}
-
-function scheduleHostReconnect() {
-  if (reconnectTimer !== null || activePorts.size === 0) return;
-  const delay = self.XiaoxuReconnectPolicy.reconnectDelayMs(reconnectAttempt);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    reconnectAttempt += 1;
-    if (activePorts.size === 0) return;
-    try { ensureBeatSubscribed(); } catch (e) {
-      console.warn('[xiaoxu-music] post-disconnect resubscribe failed:', e.message);
-      scheduleHostReconnect();
-    }
-  }, delay);
-}
-
-function ensureBeatSubscribed() {
-  if (beatSubscriptionActive && host) return;
-  const h = connectHost();
-  if (!h) return;
+async function probeHost() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 800);
   try {
-    h.postMessage({ type: 'subscribeBeat' });
-    beatLastSubscribe = Date.now();
-    beatSubscriptionActive = true;
-  } catch (e) {
-    console.warn('[xiaoxu-music] subscribeBeat postMessage failed:', e.message);
-    host = null;
-    beatSubscriptionActive = false;
-  }
-}
-
-// ---- Native host connection (single instance, multiplexed) ----
-
-function connectHost() {
-  if (host) return host;
-
-  try {
-    host = chrome.runtime.connectNative(HOST_NAME);
-    console.log('[xiaoxu-music] connectNative SUCCESS, extension ID:', chrome.runtime.id);
-  } catch (e) {
-    const err = chrome.runtime.lastError;
-    console.error('[xiaoxu-music] connectNative THROW, lastError:', err?.message, 'exception:', e.message,
-      'extension ID:', chrome.runtime.id);
-    return null;
-  }
-
-  host.onDisconnect.addListener(() => {
-    const err = chrome.runtime.lastError;
-    console.warn('[xiaoxu-music] native host DISCONNECTED, lastError:', err?.message,
-      'extension ID:', chrome.runtime.id);
-    host = null;
-    beatSubscriptionActive = false;
-    for (const [id, { reject, timeout }] of pending) {
-      pending.delete(id);
-      clearTimeout(timeout);
-      reject(new Error(err?.message || 'Native host disconnected'));
-    }
-    scheduleHostReconnect();
-  });
-
-  host.onMessage.addListener((message) => {
-    reconnectAttempt = 0;
-    cancelReconnect();
-    // Route response messages to pending requests.
-    const id = message._id;
-    if (id !== undefined && pending.has(id)) {
-      const { resolve, timeout } = pending.get(id);
-      pending.delete(id);
-      clearTimeout(timeout);
-      resolve(message);
-      return;
-    }
-
-    // Unsolicited beat push (no _id) → broadcast to all open bridge ports.
-    if (message.type === 'beat') {
-      const forward = {
-        type: 'BEAT_UPDATE',
-        bass: message.bass ?? 0,
-        volume: message.volume ?? 0,
-        pulse: message.pulse ?? 0,
-        glow: message.glow ?? 0,
-      };
-      if (message.bands) forward.bands = message.bands;
-      if (message.features) forward.features = message.features;
-      if (message.onsets) forward.onsets = message.onsets;
-      if (message.rhythm) forward.rhythm = message.rhythm;
-      if (message.state) forward.state = message.state;
-      if (typeof message.ts === 'number') forward.ts = message.ts;
-      for (const p of activePorts) {
-        try { p.postMessage(forward); } catch (e) { /* port probably closing */ }
-      }
-    }
-  });
-
-  return host;
-}
-
-function sendToHost(message, timeoutMs = 10000) {
-  return new Promise((resolve, reject) => {
-    const h = connectHost();
-    if (!h) {
-      reject(new Error('Cannot connect to native host'));
-      return;
-    }
-
-    const id = ++requestId;
-    const timeout = setTimeout(() => {
-      if (pending.has(id)) {
-        pending.delete(id);
-        reject(new Error('Native host response timeout'));
-      }
-    }, timeoutMs);
-    pending.set(id, { resolve, reject, timeout });
-    try {
-      h.postMessage({ ...message, _id: id });
-    } catch (error) {
-      clearTimeout(timeout);
-      pending.delete(id);
-      reject(error);
-    }
-  });
-}
-
-// Periodic resubscribe (host auto-unsubscribes after 30s of no refresh)
-setInterval(() => {
-  if (activePorts.size > 0 && host
-      && Date.now() - beatLastSubscribe > BEAT_RESUBSCRIBE_INTERVAL) {
-    try {
-      host.postMessage({ type: 'subscribeBeat' });
-      beatLastSubscribe = Date.now();
-    } catch (e) {
-      console.warn('[xiaoxu-music] beat resubscribe failed:', e.message);
-      host = null;
-      beatSubscriptionActive = false;
-    }
-  }
-}, 5000);
-
-// ---- Bridge request handling ----
-
-async function handleBridgeRequest(port, fetchId, message) {
-  const url = message.url || '';
-  let pathname = '';
-  try {
-    pathname = new URL(url).pathname;
+    const response = await fetch(HEALTH_URL, { cache: 'no-store', signal: controller.signal });
+    return response.ok;
   } catch {
-    try { port.postMessage({ _bridgeFetchId: fetchId, ok: false, status: 400, data: { error: 'bad url' } }); } catch (_) {}
-    return;
-  }
-
-  function reply(payload) {
-    try { port.postMessage({ _bridgeFetchId: fetchId, ...payload }); } catch (_) {}
-  }
-
-  if (pathname === '/cover/current') {
-    try {
-      const directUrl = new URL(url);
-      directUrl.hostname = 'localhost';
-      const response = await fetch(directUrl.toString(), {
-        cache: 'no-store',
-        headers: { Accept: 'image/*' },
-      });
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      reply({
-        ok: response.ok,
-        status: response.status,
-        data: self.XiaoxuBridgeBinary.encodeBridgeBinary(
-          bytes,
-          response.headers.get('content-type') || 'application/octet-stream',
-        ),
-      });
-    } catch (error) {
-      reply({ ok: false, status: 503, data: { error: error.message } });
-    }
-    return;
-  }
-
-  if (pathname === '/health') {
-    reply({ ok: true, status: 200, data: { ok: true, name: 'xiaoxu-music-bridge-extension', version: '3.3.5' } });
-    return;
-  }
-
-  if (pathname === '/state/current') {
-    let stateResp;
-    try {
-      stateResp = await sendToHost({ type: 'getState' });
-    } catch (err) {
-      reply({ ok: false, status: 503, data: { error: err.message } });
-      return;
-    }
-
-    const statusResp = stateResp.status || {};
-    const lyricsResp = stateResp.lyrics || { found: false };
-    const statusObj = {
-      connected: !!statusResp.connected,
-      source: statusResp.source ?? null,
-      viaFallback: statusResp.viaFallback ?? false,
-      playbackKnown: statusResp.playbackKnown,
-      requestedMode: statusResp.requestedMode ?? 'auto',
-      activeMode: statusResp.activeMode ?? (statusResp.viaFallback ? 'win32' : 'gsmtc'),
-      mediaError: statusResp.mediaError ?? null,
-      title: statusResp.title ?? null,
-      artist: statusResp.artist ?? null,
-      album: statusResp.album ?? null,
-      isPlaying: !!statusResp.isPlaying,
-      positionMs: statusResp.positionMs ?? 0,
-      durationMs: statusResp.durationMs ?? 0,
-      updatedAt: statusResp.updatedAt ?? null,
-    };
-
-    let coverDataUrl = null;
-    const coverKey = [statusObj.title, statusObj.artist]
-      .map((x) => (x == null ? '' : String(x))).join('|');
-    // Do not synchronously call getCover from /state/current. Native Messaging is
-    // FIFO; a slow cover lookup blocks the next getState and makes lyric changes
-    // appear ~10s late. Keep the already-cached cover for the same song only.
-    if (stateCoverKey === coverKey) {
-      coverDataUrl = stateCoverDataUrl;
-    } else {
-      stateCoverKey = coverKey;
-      stateCoverDataUrl = null;
-      chrome.storage.session.set({ coverDataUrl: null });
-    }
-
-    const signature = stateResp.signature || [statusObj.source, statusObj.title, statusObj.artist, statusObj.album]
-      .map((x) => (x == null ? '' : String(x))).join('|');
-
-    reply({
-      ok: true,
-      status: 200,
-      data: {
-        signature,
-        status: statusObj,
-        lyrics: lyricsResp && lyricsResp.found
-          ? {
-              found: true,
-              title: lyricsResp.title ?? null,
-              artist: lyricsResp.artist ?? null,
-              fileName: lyricsResp.fileName ?? null,
-              lrc: lyricsResp.lrc ?? null,
-              source: lyricsResp.source ?? null,
-              synced: !!lyricsResp.synced,
-            }
-          : { found: false },
-        coverDataUrl,
-        cached: !!stateResp.cached,
-      },
-    });
-    return;
-  }
-
-  let hostMessage;
-  if (pathname === '/settings/media-mode') {
-    if ((message.method || 'GET').toUpperCase() === 'PUT') {
-      let mode;
-      try { mode = JSON.parse(message.body || '{}').mode; } catch (_) {
-        reply({ ok: false, status: 400, data: { error: 'invalid JSON body' } });
-        return;
-      }
-      hostMessage = { type: 'setMediaMode', mode };
-    } else {
-      hostMessage = { type: 'getMediaMode' };
-    }
-  } else if (pathname === '/gsmtc/repair') {
-    hostMessage = { type: 'repairGsmtc' };
-  } else if (pathname === '/gsmtc/health') {
-    hostMessage = { type: 'getGsmtcHealth' };
-  } else if (pathname === '/status' || pathname === '/api/status') {
-    hostMessage = { type: 'getStatus' };
-  } else if (pathname.startsWith('/control/')) {
-    const cmd = pathname.split('/').pop();
-    hostMessage = { type: 'control', command: cmd };
-  } else if (pathname === '/lyrics/current') {
-    hostMessage = { type: 'getLyrics' };
-  } else if (pathname === '/beat/current') {
-    hostMessage = { type: 'getBeat' };
-  } else {
-    reply({ ok: false, status: 404, data: {} });
-    return;
-  }
-
-  try {
-    const response = await sendToHost(hostMessage, pathname === '/gsmtc/repair' ? 90000 : 10000);
-    if (response.type === 'status' && (response.hasCover || response.source === 'QQMusic')) {
-      const cover = await sendToHost({ type: 'getCover' });
-      if (cover.data) {
-        const dataUrl = `data:${cover.contentType};base64,${cover.data}`;
-        chrome.storage.session.set({ coverDataUrl: dataUrl });
-        response.coverUrl = 'cover:ready';
-      } else {
-        chrome.storage.session.set({ coverDataUrl: null });
-        response.coverUrl = null;
-      }
-    }
-    if (response.type === 'status' && !response.hasCover) {
-      chrome.storage.session.set({ coverDataUrl: null });
-    }
-    const ok = response.type !== 'error';
-    const status = ok ? 200 : (response.message === 'Invalid media mode' ? 400 : 503);
-    reply({ ok, status, data: response });
-  } catch (err) {
-    reply({ ok: false, status: 503, data: { error: err.message } });
+    return false;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-// ---- Single port per content script: "xiaoxu-bridge" ----
+function launchHost() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, { type: 'ensureServer' }, (response) => {
+      const error = chrome.runtime.lastError;
+      if (error) resolve({ ok: false, error: error.message });
+      else resolve(response || { ok: false, error: 'Native launcher returned no response' });
+    });
+  });
+}
+
+const ensureHost = self.XiaoxuHostBootstrap.createHostEnsurer({ probe: probeHost, launch: launchHost });
+
+async function checkHost() {
+  const result = await ensureHost();
+  for (const port of activePorts) {
+    try { port.postMessage({ type: 'HOST_STATUS', ...result }); } catch { }
+  }
+}
+
+function updateHealthTimer() {
+  if (activePorts.size > 0 && healthTimer == null) {
+    healthTimer = setInterval(() => { void checkHost(); }, 60000);
+  } else if (activePorts.size === 0 && healthTimer != null) {
+    clearInterval(healthTimer);
+    healthTimer = null;
+  }
+}
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'xiaoxu-bridge') return;
-
+  if (port.name !== 'xiaoxu-host-launcher') return;
   activePorts.add(port);
-  console.log('[xiaoxu-music] bridge port connected, total:', activePorts.size);
-
-  // Start beat as soon as any port is up; stop when the last one disconnects.
-  ensureBeatSubscribed();
+  updateHealthTimer();
+  void checkHost();
 
   port.onDisconnect.addListener(() => {
     activePorts.delete(port);
-    console.log('[xiaoxu-music] bridge port disconnected, remaining:', activePorts.size);
-    if (activePorts.size === 0 && host) {
-      try { host.postMessage({ type: 'unsubscribeBeat' }); } catch (e) {}
-      beatSubscriptionActive = false;
-    }
-    if (activePorts.size === 0) cancelReconnect();
-  });
-
-  port.onMessage.addListener((message) => {
-    if (!message || message.type !== 'bridgeRequest') return;
-    const fetchId = message._bridgeFetchId;
-    handleBridgeRequest(port, fetchId, message).catch((e) => {
-      try {
-        port.postMessage({ _bridgeFetchId: fetchId, ok: false, status: 503, data: { error: e.message } });
-      } catch (_) {}
-    });
+    updateHealthTimer();
   });
 });
