@@ -2,6 +2,9 @@ using xiaoxu_music_bridge.Common;
 
 var failures = new List<string>();
 
+try { await PcmAudioBroadcasterTests.ReadAsyncEndsWhenStreamEnds(); }
+catch (Exception ex) { failures.Add($"FAIL: PCM stream lifecycle: {ex.Message}"); }
+
 Run("missing settings default to auto", () =>
 {
     using var temp = new TempDirectory();
@@ -115,7 +118,7 @@ if (failures.Count > 0)
     return 1;
 }
 
-Console.WriteLine("PASS: 15 host policy tests");
+Console.WriteLine("PASS: 15 host policy tests + PCM stream tests");
 return 0;
 
 void Run(string name, Action test)

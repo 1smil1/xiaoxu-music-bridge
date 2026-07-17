@@ -55,18 +55,6 @@ public sealed class BridgeHttpServer : IDisposable
     private const string HostVersion = "3.4.0";
     private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
 
-    // Spec § CORS 要求. localhost dev origins let `npm run dev` work on the
-    // user's machine during frontend iteration without modifying this list.
-    private static readonly HashSet<string> AllowedOrigins = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "http://xiaoxu.xin",
-        "https://xiaoxu.xin",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    };
-
     private const string AllowMethods = "GET, PUT, POST, OPTIONS";
     private const string AllowHeaders = "Content-Type";
     private const string MaxAge = "86400";
@@ -105,6 +93,7 @@ public sealed class BridgeHttpServer : IDisposable
 
     private HttpListener? _listener;
     private Thread? _thread;
+    private CancellationTokenSource _stopCts = new();
     private volatile bool _running;
 
     public bool IsRunning => _running;
@@ -158,6 +147,12 @@ public sealed class BridgeHttpServer : IDisposable
         if (_running) return;
         try
         {
+            if (_stopCts.IsCancellationRequested)
+            {
+                _stopCts.Dispose();
+                _stopCts = new CancellationTokenSource();
+            }
+
             _listener = new HttpListener();
             // v3.2.7 hotfix: bind via the loopback hostname so the listener
             // accepts BOTH ::1 (IPv6) and 127.0.0.1 (IPv4). Windows resolves
@@ -189,6 +184,7 @@ public sealed class BridgeHttpServer : IDisposable
     public void Stop()
     {
         _running = false;
+        try { _stopCts.Cancel(); } catch { }
         try { _listener?.Stop(); } catch { }
         _listener = null;
     }
@@ -234,6 +230,14 @@ public sealed class BridgeHttpServer : IDisposable
             // route table below.
             if (req.HttpMethod == "OPTIONS")
             {
+                if (path == "/audio/stream"
+                    && !AudioStreamOriginPolicy.IsAllowed(req.Headers["Origin"]))
+                {
+                    ctx.Response.StatusCode = 403;
+                    ctx.Response.Close();
+                    return;
+                }
+
                 WriteCorsHeaders(ctx, includeAllowHeaders: true);
                 ctx.Response.StatusCode = 204;
                 ctx.Response.Close();
@@ -304,6 +308,12 @@ public sealed class BridgeHttpServer : IDisposable
             case "/beat/current":
                 {
                     WriteRawJson(ctx, 200, BuildBeatJson());
+                }
+                break;
+
+            case "/audio/stream":
+                {
+                    await HandleAudioStream(ctx);
                 }
                 break;
 
@@ -507,6 +517,20 @@ public sealed class BridgeHttpServer : IDisposable
         }
 
         string sig = ComputeSignature(title, artist, coverDataUrl, lyrics?.Lrc);
+        object? audioClock = null;
+        AudioBeatService? beat;
+        lock (_beatLock) beat = _beatService;
+        if (beat != null)
+        {
+            var clock = beat.GetAudioClock();
+            audioClock = new
+            {
+                sampleIndex = clock.SampleIndex,
+                sampleRate = clock.SampleRate,
+                monotonicMs = clock.MonotonicMs,
+                discontinuityId = clock.DiscontinuityId,
+            };
+        }
 
         return new
         {
@@ -515,6 +539,7 @@ public sealed class BridgeHttpServer : IDisposable
             lyrics,
             signature = sig,
             cached = haveCover || haveLyrics,
+            audioClock,
         };
     }
 
@@ -673,6 +698,67 @@ public sealed class BridgeHttpServer : IDisposable
         AudioBeatService? svc;
         lock (_beatLock) svc = _beatService;
         return BeatHttpResponsePolicy.SelectJson(svc?.GetFullSnapshotJson());
+    }
+
+    private async Task HandleAudioStream(HttpListenerContext ctx)
+    {
+        if (!AudioStreamOriginPolicy.IsAllowed(ctx.Request.Headers["Origin"]))
+        {
+            WriteJson(ctx, 403, new { error = "origin not allowed" });
+            return;
+        }
+
+        AudioBeatService? svc;
+        lock (_beatLock) svc = _beatService;
+        var availabilityStatus = AudioStreamAvailabilityPolicy.StatusCode(
+            svc != null,
+            svc?.IsCaptureReady == true);
+        if (availabilityStatus != 200 || svc == null)
+        {
+            WriteJson(ctx, availabilityStatus, new { error = "audio capture unavailable" });
+            return;
+        }
+
+        if (!svc.TrySubscribeAudio(out var subscription) || subscription == null)
+        {
+            WriteJson(ctx, 409, new { error = "audio stream already subscribed" });
+            return;
+        }
+
+        using (subscription)
+        {
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "application/octet-stream";
+            ctx.Response.SendChunked = true;
+            ctx.Response.KeepAlive = true;
+            ctx.Response.Headers["Cache-Control"] = "no-store";
+            ctx.Response.Headers["X-Content-Type-Options"] = "nosniff";
+
+            try
+            {
+                while (_running && !_stopCts.IsCancellationRequested)
+                {
+                    var packet = await subscription.ReadAsync(_stopCts.Token);
+                    await ctx.Response.OutputStream.WriteAsync(packet, _stopCts.Token);
+                    await ctx.Response.OutputStream.FlushAsync(_stopCts.Token);
+                }
+            }
+            catch (OperationCanceledException) when (_stopCts.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex) when (
+                ex is HttpListenerException
+                or IOException
+                or EndOfStreamException
+                or ObjectDisposedException)
+            {
+                Log($"Audio stream disconnected: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                try { ctx.Response.Close(); } catch { }
+            }
+        }
     }
 
     // --- Control -----------------------------------------------------------
@@ -868,10 +954,10 @@ public sealed class BridgeHttpServer : IDisposable
             // is safe because we only listen on 127.0.0.1.
             allowOrigin = "*";
         }
-        else if (AllowedOrigins.Contains(origin))
+        else if (AudioStreamOriginPolicy.IsAllowed(origin))
         {
-            // Echo the requested origin so the browser's credentialed mode
-            // and response body work. Per spec § CORS 要求.
+            // Echo the requested origin so browser CORS checks can expose
+            // loopback responses to the approved site and development origins.
             allowOrigin = origin;
         }
         else

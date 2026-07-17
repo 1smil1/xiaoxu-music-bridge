@@ -47,6 +47,8 @@ public sealed class AudioBeatService : IDisposable
     private int _channels;
     private string _deviceName = "unknown";
     private AudioDebugServer? _debugServer;
+    private readonly PcmAudioBroadcaster _pcmBroadcaster = new();
+    private volatile bool _captureReady;
 
     // Analysis pipeline
     private Fft? _fft;
@@ -86,14 +88,31 @@ public sealed class AudioBeatService : IDisposable
 
     public void Start()
     {
+        _captureReady = false;
         try
         {
             _capture = new WasapiLoopbackCapture();
+            var waveFormat = _capture.WaveFormat;
+            if (!AudioCaptureFormatPolicy.IsSupported(
+                waveFormat.Encoding == WaveFormatEncoding.IeeeFloat,
+                waveFormat.BitsPerSample,
+                waveFormat.BlockAlign,
+                waveFormat.Channels))
+            {
+                throw new NotSupportedException(
+                    $"WASAPI mix format must be Float32; got {waveFormat.Encoding}/{waveFormat.BitsPerSample}-bit, blockAlign={waveFormat.BlockAlign}, channels={waveFormat.Channels}");
+            }
             _sampleRate = _capture.WaveFormat.SampleRate;
             _channels = _capture.WaveFormat.Channels;
             _deviceName = GetDefaultRenderDeviceName();
             _capture.DataAvailable += OnDataAvailable;
+            _capture.RecordingStopped += (_, _) =>
+            {
+                _captureReady = false;
+                _pcmBroadcaster.EndStream();
+            };
             _capture.StartRecording();
+            _captureReady = true;
 
             // Initialize pipeline with actual sample rate
             _fft = new Fft(FftSize);
@@ -124,6 +143,9 @@ public sealed class AudioBeatService : IDisposable
         }
         catch (Exception ex)
         {
+            _captureReady = false;
+            try { _capture?.Dispose(); } catch { }
+            _capture = null;
             Log($"AudioBeatService.Start FAILED: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
         }
     }
@@ -147,8 +169,13 @@ public sealed class AudioBeatService : IDisposable
             var samples = MemoryMarshal.Cast<byte, float>(byteSpan);
             if (samples.Length == 0) return;
 
-            // Downmix to mono + push to ring buffer
             int ch = _capture?.WaveFormat.Channels ?? 2;
+            int capturedFrames = samples.Length / ch;
+            long callbackUs = _wallClock.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+            long firstSampleUs = callbackUs - capturedFrames * 1_000_000L / _sampleRate;
+            _pcmBroadcaster.Publish(samples, _sampleRate, ch, Math.Max(0, firstSampleUs));
+
+            // Downmix to mono + push to ring buffer
             lock (_ringLock)
             {
                 for (int i = 0; i < samples.Length; i += ch)
@@ -263,6 +290,7 @@ public sealed class AudioBeatService : IDisposable
             var o = _latestOnsets;
             var b = _beats?.State ?? new BeatState();
             var s = _stateDetector?.State ?? new AudioState();
+            var clock = _pcmBroadcaster.GetClock();
 
             // Map new v3 fields back to legacy bass/pulse/glow for backward compat
             // - bass: smoothed bass band (0-1)
@@ -327,6 +355,14 @@ public sealed class AudioBeatService : IDisposable
                     silenceDuration = MathF.Round(s.SilenceDuration, 2),
                 },
 
+                audioClock = new
+                {
+                    sampleIndex = clock.SampleIndex,
+                    sampleRate = clock.SampleRate,
+                    monotonicMs = clock.MonotonicMs,
+                    discontinuityId = clock.DiscontinuityId,
+                },
+
                 ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             });
         }
@@ -372,6 +408,13 @@ public sealed class AudioBeatService : IDisposable
     {
         return SerializeSnapshot();
     }
+
+    public bool TrySubscribeAudio(out PcmAudioSubscription? subscription) =>
+        _pcmBroadcaster.TrySubscribe(out subscription);
+
+    public AudioClockSnapshot GetAudioClock() => _pcmBroadcaster.GetClock();
+
+    public bool IsCaptureReady => _captureReady;
 
     // ---- Public diagnostic surface for AudioDebugServer ----
 
@@ -472,9 +515,11 @@ public sealed class AudioBeatService : IDisposable
     public void Dispose()
     {
         _running = false;
+        _captureReady = false;
         try { _capture?.StopRecording(); } catch { }
         try { _capture?.Dispose(); } catch { }
         _capture = null;
+        _pcmBroadcaster.Dispose();
     }
 
     private static void Log(string msg)

@@ -14,5 +14,9 @@
     <Compile Include="../host/Common/CoverIdentity.cs" Link="CoverIdentity.cs" />
     <Compile Include="../host/Common/HostLaunchPolicy.cs" Link="HostLaunchPolicy.cs" />
     <Compile Include="../host/Common/BeatHttpResponsePolicy.cs" Link="BeatHttpResponsePolicy.cs" />
+    <Compile Include="../host/Audio/PcmAudioBroadcaster.cs" Link="PcmAudioBroadcaster.cs" />
+    <Compile Include="../host/Common/AudioStreamOriginPolicy.cs" Link="AudioStreamOriginPolicy.cs" />
+    <Compile Include="../host/Common/AudioCaptureFormatPolicy.cs" Link="AudioCaptureFormatPolicy.cs" />
+    <Compile Include="../host/Common/AudioStreamAvailabilityPolicy.cs" Link="AudioStreamAvailabilityPolicy.cs" />
   </ItemGroup>
 </Project>
