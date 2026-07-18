@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApngvd9pFIEebLx72mo1JysmrexOwGUnglYHM/AzDf9OON2kvLKrDrKzCclVWht+Fh40yLW8pmBvZ0yIP6gNljauEBPivrq18/YQ5aTTGsjGC5Uga/rhkBJlCWgNugzbcdVAN+UwEO0KBMAUcdwjT5B7Q5g0JF+u+rl5WAt8QdGs9CfOAmKqpVm/WNtuDzmhn4Kj/fVkx2ImC/9WjgHwrFWeMU6frRKF60zioGtm+Gtv9yi8qMDbnj/lw8waaMsHQi622oZ5rLSCpslBRF5M8q3n915znZbumWK/nt/1wytfEL8zjSeQwsZH0Q3nPxRneL7ISyCFx4kL9cP3F+Nlm/QIDAQAB",
   "name": "xiaoxu-music-bridge",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "description": "启动并守护 xiaoxu-music-host，本地媒体数据由网页直接连接 Host",
   "permissions": [
     "nativeMessaging"

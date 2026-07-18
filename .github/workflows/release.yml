@@ -1,0 +1,105 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate stable tag and runtime versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $stableTagPattern = '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          if ($tag -notmatch $stableTagPattern) {
+            throw "Release tag '$tag' must match $stableTagPattern."
+          }
+
+          $tagVersion = $tag.Substring(1)
+          $manifest = Get-Content -LiteralPath '.\xiaoxu-music-extension\extension\manifest.json' -Raw | ConvertFrom-Json
+          $manifestVersion = [string]$manifest.version
+          $bridgeSource = Get-Content -LiteralPath '.\xiaoxu-music-extension\host\Bridge\BridgeHttpServer.cs' -Raw
+          $hostVersionMatch = [regex]::Match(
+            $bridgeSource,
+            'private\s+const\s+string\s+HostVersion\s*=\s*"([^"]+)"\s*;'
+          )
+          if (-not $hostVersionMatch.Success) {
+            throw 'Could not extract HostVersion from BridgeHttpServer.cs.'
+          }
+
+          $hostVersion = $hostVersionMatch.Groups[1].Value
+          if ($manifestVersion -ne $tagVersion -or $hostVersion -ne $tagVersion) {
+            throw "Tag version '$tagVersion' does not match manifest '$manifestVersion' and Host '$hostVersion'."
+          }
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Test Host
+        run: dotnet run --project .\xiaoxu-music-extension\host.Tests\xiaoxu-music-host.Tests.csproj --configuration Release
+
+      - name: Test bridge binary encoding
+        run: node --test .\xiaoxu-music-extension\extension\bridge-binary.test.cjs
+
+      - name: Test Host bootstrap
+        run: node --test .\xiaoxu-music-extension\extension\host-bootstrap.test.cjs
+
+      - name: Test reconnect policy
+        run: node --test .\xiaoxu-music-extension\extension\reconnect-policy.test.cjs
+
+      - name: Build release assets
+        shell: pwsh
+        run: .\scripts\Build-Release.ps1 -SmokeTest
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $assets = @(
+            '.\artifacts\xiaoxu-music-bridge-windows-x64.zip'
+            '.\artifacts\xiaoxu-music-bridge-windows-x64.zip.sha256'
+          )
+
+          $tag = $env:GITHUB_REF_NAME
+          $title = "xiaoxu-music-bridge $tag"
+          $null = gh release view $tag --json tagName
+          $viewExitCode = $LASTEXITCODE
+          if ($viewExitCode -ne 0) {
+            gh release create $tag --verify-tag --draft --generate-notes --title $title
+            $createExitCode = $LASTEXITCODE
+            if ($createExitCode -ne 0) {
+              # A concurrent rerun may have created the release after the view.
+              $null = gh release view $tag --json tagName
+              if ($LASTEXITCODE -ne 0) {
+                throw "Unable to find or create release '$tag' (create exit code $createExitCode)."
+              }
+            }
+          }
+
+          gh release upload $tag @assets --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release upload failed with exit code $LASTEXITCODE."
+          }
+
+          gh release edit $tag --draft=false --latest --title $title
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release edit failed with exit code $LASTEXITCODE."
+          }
