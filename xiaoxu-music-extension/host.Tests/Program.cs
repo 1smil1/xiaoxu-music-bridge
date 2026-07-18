@@ -80,6 +80,34 @@ Run("server replacement waits for the previous process", () =>
     Equal("--server", HostLaunchPolicy.BuildServerArguments(null));
 });
 
+Run("bridge endpoint defaults for missing and invalid ports", () =>
+{
+    foreach (var value in new string?[] { null, "", "invalid", "1023", "65536", "-1" })
+        Equal(BridgeEndpointSettings.DefaultPort, BridgeEndpointSettings.Resolve(value).Port);
+});
+
+Run("bridge endpoint accepts a valid custom port", () =>
+{
+    var settings = BridgeEndpointSettings.Resolve("24567");
+    Equal(24567, settings.Port);
+    Equal("http://localhost:24567/health", settings.HealthUri.AbsoluteUri);
+    Equal("http://localhost:24567/", settings.ListenerPrefix);
+});
+
+Run("default bridge mutex remains compatible", () =>
+{
+    var settings = BridgeEndpointSettings.Resolve(null);
+    Equal(@"Local\xiaoxu-music-host-server", HostLaunchPolicy.ResolveServerMutexName(settings));
+});
+
+Run("custom bridge mutex is port specific", () =>
+{
+    var first = HostLaunchPolicy.ResolveServerMutexName(BridgeEndpointSettings.Resolve("24567"));
+    var second = HostLaunchPolicy.ResolveServerMutexName(BridgeEndpointSettings.Resolve("24568"));
+    Equal(false, first == HostLaunchPolicy.ServerMutexName);
+    Equal(false, first == second);
+});
+
 Run("beat HTTP response preserves the complete v3 audio frame", () =>
 {
     const string frame = "{\"type\":\"beat\",\"bass\":0.2,\"bands\":{\"sub\":0.1},\"features\":{\"rms\":0.02},\"onsets\":{},\"rhythm\":{},\"state\":{},\"ts\":123}";
@@ -127,7 +155,7 @@ if (failures.Count > 0)
     return 1;
 }
 
-Console.WriteLine("PASS: 16 host policy tests + PCM stream tests");
+Console.WriteLine("PASS: 20 host policy tests + PCM stream tests");
 return 0;
 
 void Run(string name, Action test)

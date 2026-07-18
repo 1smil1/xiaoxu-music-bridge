@@ -4,6 +4,7 @@ obj/
 .vscode/
 TestResults/
 publish/
+artifacts/
 *.user
 *.suo
 

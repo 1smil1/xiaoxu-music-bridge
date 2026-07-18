@@ -28,15 +28,16 @@ if (args.Contains("--restart-gsmtc-services", StringComparer.OrdinalIgnoreCase))
 
 try
 {
+var endpointSettings = BridgeEndpointSettings.FromEnvironment();
 var launchMode = HostLaunchPolicy.Resolve(args);
 if (launchMode == HostLaunchMode.NativeMessaging)
 {
-    await RunNativeLauncherAsync();
+    await RunNativeLauncherAsync(endpointSettings);
     return;
 }
 
 var waitForPid = HostLaunchPolicy.GetWaitForPid(args);
-if (waitForPid is null && await IsServerHealthyAsync()) return;
+if (waitForPid is null && await IsServerHealthyAsync(endpointSettings)) return;
 if (waitForPid is > 0)
 {
     try
@@ -47,7 +48,10 @@ if (waitForPid is > 0)
     catch (ArgumentException) { }
 }
 
-using var serverMutex = new Mutex(initiallyOwned: true, HostLaunchPolicy.ServerMutexName, out var ownsServerMutex);
+using var serverMutex = new Mutex(
+    initiallyOwned: true,
+    HostLaunchPolicy.ResolveServerMutexName(endpointSettings),
+    out var ownsServerMutex);
 if (!ownsServerMutex) return;
 
 var hostStartedAt = DateTimeOffset.Now;
@@ -152,14 +156,14 @@ var stdoutLock = new object();
 // v3.2.4: HTTP server on http://127.0.0.1:17888/ for Lively Wallpaper + Chrome
 // without extension. Listens on loopback only (per spec § 安全边界). Shares the
 // same GSMTC + Win32 fallback pipeline as the Native Messaging handlers.
-var bridgeHttp = new BridgeHttpServer(gsmtcService, win32Fallback);
+var bridgeHttp = new BridgeHttpServer(gsmtcService, win32Fallback, endpointSettings);
 bridgeHttp.SetLyricService(lyricService);
 bridgeHttp.SetCoverLookupServices(coverLookup, itunesCoverLookup);
 bridgeHttp.Start();
 if (!bridgeHttp.IsRunning)
-    throw new InvalidOperationException("Bridge HTTP server could not bind localhost:17888");
+    throw new InvalidOperationException($"Bridge HTTP server could not bind {endpointSettings.ListenerPrefix}");
 LogPaths.SafeAppend(LogPaths.DebugLog,
-    $"[{DateTime.Now:HH:mm:ss}] BridgeHttpServer STARTED on http://127.0.0.1:17888/\n");
+    $"[{DateTime.Now:HH:mm:ss}] BridgeHttpServer STARTED on {endpointSettings.ListenerPrefix}\n");
 
 // v3.2.2.1: Register GSMTC recovery probe. When the status breaker opens
 // (e.g., user seeked in QQ Music → CEF animation briefly deadlocked GSMTC),
@@ -615,7 +619,7 @@ static async Task<string> HandleGetLyrics(
     return JsonSerializer.Serialize(BuildLyricsResponse(lyrics, viaFallback));
 }
 
-static async Task RunNativeLauncherAsync()
+static async Task RunNativeLauncherAsync(BridgeEndpointSettings endpointSettings)
 {
     var stdin = Console.OpenStandardInput();
     var stdout = Console.OpenStandardOutput();
@@ -636,7 +640,7 @@ static async Task RunNativeLauncherAsync()
     }
     catch (JsonException) { }
 
-    var result = await EnsureServerAsync();
+    var result = await EnsureServerAsync(endpointSettings);
     var response = new Dictionary<string, object?>
     {
         ["type"] = "ensureServer",
@@ -647,9 +651,9 @@ static async Task RunNativeLauncherAsync()
     WriteMessage(stdout, JsonSerializer.Serialize(response));
 }
 
-static async Task<(bool ok, string? error)> EnsureServerAsync()
+static async Task<(bool ok, string? error)> EnsureServerAsync(BridgeEndpointSettings endpointSettings)
 {
-    if (await IsServerHealthyAsync()) return (true, null);
+    if (await IsServerHealthyAsync(endpointSettings)) return (true, null);
 
     var exePath = Environment.ProcessPath;
     if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
@@ -674,17 +678,17 @@ static async Task<(bool ok, string? error)> EnsureServerAsync()
     for (var attempt = 0; attempt < 25; attempt++)
     {
         await Task.Delay(200);
-        if (await IsServerHealthyAsync()) return (true, null);
+        if (await IsServerHealthyAsync(endpointSettings)) return (true, null);
     }
     return (false, "Server did not become healthy within 5 seconds");
 }
 
-static async Task<bool> IsServerHealthyAsync()
+static async Task<bool> IsServerHealthyAsync(BridgeEndpointSettings endpointSettings)
 {
     try
     {
         using var client = new HttpClient { Timeout = TimeSpan.FromMilliseconds(500) };
-        using var response = await client.GetAsync("http://localhost:17888/health");
+        using var response = await client.GetAsync(endpointSettings.HealthUri);
         return response.IsSuccessStatusCode;
     }
     catch

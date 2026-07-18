@@ -51,7 +51,6 @@ namespace xiaoxu_music_bridge.Bridge;
 
 public sealed class BridgeHttpServer : IDisposable
 {
-    private const int Port = 17888;
     private const string HostVersion = "3.4.0";
     private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
 
@@ -61,6 +60,7 @@ public sealed class BridgeHttpServer : IDisposable
 
     private readonly WindowsMediaSessionService _gsmtc;
     private readonly Win32MediaService _win32Fallback;
+    private readonly BridgeEndpointSettings _endpoint;
     private readonly MediaModeStore _mediaModeStore;
     private readonly GsmtcRecoveryService _gsmtcRecovery = new();
     private readonly object _lyricLock = new();
@@ -100,10 +100,12 @@ public sealed class BridgeHttpServer : IDisposable
 
     public BridgeHttpServer(
         WindowsMediaSessionService gsmtc,
-        Win32MediaService win32Fallback)
+        Win32MediaService win32Fallback,
+        BridgeEndpointSettings endpoint)
     {
         _gsmtc = gsmtc;
         _win32Fallback = win32Fallback;
+        _endpoint = endpoint;
         _mediaModeStore = new MediaModeStore(Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "xiaoxu-music-host"));
@@ -166,14 +168,14 @@ public sealed class BridgeHttpServer : IDisposable
             // Loopback-only — spec § 安全边界: local API must NOT be reachable
             // from the LAN. Windows Firewall covers the gap if a future
             // maintainer accidentally widens the prefix.
-            _listener.Prefixes.Add($"http://localhost:{Port}/");
+            _listener.Prefixes.Add(_endpoint.ListenerPrefix);
             _listener.Start();
             _running = true;
 
             _thread = new Thread(Loop) { IsBackground = true, Name = "BridgeHttpServer" };
             _thread.Start();
 
-            Log($"BridgeHttpServer started on http://localhost:{Port}/ (IPv4 + IPv6 loopback)");
+            Log($"BridgeHttpServer started on {_endpoint.ListenerPrefix} (IPv4 + IPv6 loopback)");
         }
         catch (Exception ex)
         {

@@ -10,6 +10,8 @@ public static class HostLaunchPolicy
 {
     public const string ServerMutexName = @"Local\xiaoxu-music-host-server";
 
+    public static string ResolveServerMutexName(BridgeEndpointSettings endpoint) => endpoint.ServerMutexName;
+
     public static HostLaunchMode Resolve(IEnumerable<string> args) =>
         args.Any(arg => string.Equals(arg, "--server", StringComparison.OrdinalIgnoreCase))
             ? HostLaunchMode.Server
