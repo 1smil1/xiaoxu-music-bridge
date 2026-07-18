@@ -107,6 +107,15 @@ Run("debug log rotates when the next write exceeds the size limit", () =>
     Equal("12345678", File.ReadAllText(path + ".1"));
 });
 
+Run("debug log stays under current local application data", () =>
+{
+    var expected = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "xiaoxu-music-host",
+        "debug.log");
+    Equal(Path.GetFullPath(expected), Path.GetFullPath(LogPaths.DebugLog));
+});
+
 Run("cover identity is song based and independent of media mode", () =>
 {
     Equal("underwater|权恩妃 (권은비)", CoverIdentity.Create("  Underwater ", "权恩妃  (권은비)"));
@@ -118,7 +127,7 @@ if (failures.Count > 0)
     return 1;
 }
 
-Console.WriteLine("PASS: 15 host policy tests + PCM stream tests");
+Console.WriteLine("PASS: 16 host policy tests + PCM stream tests");
 return 0;
 
 void Run(string name, Action test)
