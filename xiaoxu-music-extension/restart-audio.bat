@@ -1,6 +1,8 @@
 @echo off
 chcp 65001 >nul 2>&1
 title xiaoxu-music-bridge GSMTC deadlock recovery
+set "HOST_EXE=%~dp0xiaoxu-music-host.exe"
+set "XIAOXU_RESTART_SCRIPT=%~f0"
 
 echo.
 echo  ========================================================
@@ -19,7 +21,7 @@ pause
 net session >nul 2>&1
 if %errorLevel% neq 0 (
   echo  [INFO] Requesting administrator privileges...
-  powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+  powershell -NoProfile -Command "Start-Process -FilePath $env:XIAOXU_RESTART_SCRIPT -Verb RunAs"
   exit /b
 )
 
@@ -62,11 +64,11 @@ echo         AudioEndpointBuilder restarted
 
 echo.
 echo  [5/5] Relaunching host...
-if exist "D:\music_bridge\xiaoxu-music-bridge\xiaoxu-music-host.exe" (
-  start "" "D:\music_bridge\xiaoxu-music-bridge\xiaoxu-music-host.exe" --parent-window=0
+if exist "%HOST_EXE%" (
+  start "" "%HOST_EXE%" --server
   echo         host relaunched
 ) else (
-  echo         [WARN] xiaoxu-music-host.exe not found at expected path
+  echo         [WARN] xiaoxu-music-host.exe not found next to this script
   echo         Start it manually after this script exits
 )
 

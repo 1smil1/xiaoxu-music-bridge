@@ -13,8 +13,7 @@ echo.
 pause
 echo.
 
-set "INSTALL_DIR=%~dp0"
-set "INSTALL_DIR=%INSTALL_DIR:~0,-1%"
+for %%I in ("%~dp0.") do set "INSTALL_DIR=%%~fI"
 
 if not exist "%INSTALL_DIR%\xiaoxu-music-host.exe" (
     echo  [ERROR] xiaoxu-music-host.exe not found
@@ -35,6 +34,39 @@ if not exist "%INSTALL_DIR%\EXTENSION_ID.txt" (
     exit /b 1
 )
 
+for %%F in (
+    background.js
+    host-bootstrap.js
+    content.js
+    reconnect-policy.js
+    manifest.json
+    icon16.png
+    icon48.png
+    icon128.png
+) do (
+    if not exist "%INSTALL_DIR%\extension\%%F" (
+        echo  [ERROR] extension\%%F not found
+        echo.
+        pause
+        exit /b 1
+    )
+)
+
+for %%F in (
+    D3DCompiler_47_cor3.dll
+    PenImc_cor3.dll
+    PresentationNative_cor3.dll
+    vcruntime140_cor3.dll
+    wpfgfx_cor3.dll
+) do (
+    if not exist "%INSTALL_DIR%\%%F" (
+        echo  [ERROR] Required Host runtime sidecar not found: %%F
+        echo.
+        pause
+        exit /b 1
+    )
+)
+
 set /p EXT_ID= < "%INSTALL_DIR%\EXTENSION_ID.txt"
 set "EXT_ID=%EXT_ID: =%"
 
@@ -44,6 +76,9 @@ if "%EXT_ID%"=="" (
     pause
     exit /b 1
 )
+
+set "XIAOXU_INSTALL_DIR=%INSTALL_DIR%"
+set "XIAOXU_EXTENSION_ID=%EXT_ID%"
 
 echo  [1/5] Extension ID: %EXT_ID%
 echo  [1/5] Install path: %INSTALL_DIR%
@@ -56,7 +91,7 @@ echo  [2/5] OK
 echo.
 
 echo  [3/5] Generating xiaoxu_music_host.json ...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$j = @{name='xiaoxu_music_host';description='xiaoxu-music-bridge native messaging host';path='%INSTALL_DIR%\xiaoxu-music-host.exe';type='stdio';allowed_origins=@('chrome-extension://%EXT_ID%/')} | ConvertTo-Json -Compress; [System.IO.File]::WriteAllText('%INSTALL_DIR%\xiaoxu_music_host.json', $j)" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$hostPath = [System.IO.Path]::Combine($env:XIAOXU_INSTALL_DIR, 'xiaoxu-music-host.exe'); $manifestPath = [System.IO.Path]::Combine($env:XIAOXU_INSTALL_DIR, 'xiaoxu_music_host.json'); $origin = 'chrome-extension://' + $env:XIAOXU_EXTENSION_ID + '/'; $j = @{name='xiaoxu_music_host';description='xiaoxu-music-bridge native messaging host';path=$hostPath;type='stdio';allowed_origins=@($origin)} | ConvertTo-Json -Compress; [System.IO.File]::WriteAllText($manifestPath, $j)" >nul 2>&1
 if %errorlevel% neq 0 (
     echo  [3/5] FAILED - PowerShell error
     echo.
@@ -142,7 +177,9 @@ echo  [6/5] Creating desktop shortcut for audio recovery...
 set "RECOVERY_BAT=%INSTALL_DIR%\restart-audio.bat"
 set "DESKTOP=%USERPROFILE%\Desktop"
 set "SHORTCUT=%DESKTOP%\重启音频服务 (xiaoxu-music-bridge).lnk"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT%'); $s.TargetPath = '%RECOVERY_BAT%'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.WindowStyle = 1; $s.Description = 'Restart Windows Audio services to clear GSMTC deadlock'; $s.IconLocation = 'mmcbase.dll,1'; $s.Save()" >nul 2>&1
+set "XIAOXU_RECOVERY_BAT=%RECOVERY_BAT%"
+set "XIAOXU_SHORTCUT=%SHORTCUT%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut($env:XIAOXU_SHORTCUT); $s.TargetPath = $env:XIAOXU_RECOVERY_BAT; $s.WorkingDirectory = $env:XIAOXU_INSTALL_DIR; $s.WindowStyle = 1; $s.Description = 'Restart Windows Audio services to clear GSMTC deadlock'; $s.IconLocation = 'mmcbase.dll,1'; $s.Save()" >nul 2>&1
 if exist "%SHORTCUT%" (
     echo  [6/5] OK - shortcut: %SHORTCUT%
 ) else (
