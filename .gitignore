@@ -1,9 +1,27 @@
+# Build artifacts
 bin/
 obj/
 .vs/
 .vscode/
 TestResults/
 publish/
+publish-new/
 *.user
 *.suo
+*.exe
+*.pdb
+*.dll
+
+# Packaged releases
+*.zip
+*.tar.gz
+
+# IDE
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+logs/
 
