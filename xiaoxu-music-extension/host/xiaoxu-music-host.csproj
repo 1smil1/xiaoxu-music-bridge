@@ -8,6 +8,35 @@
     <RootNamespace>xiaoxu_music_bridge</RootNamespace>
     <PublishSingleFile>true</PublishSingleFile>
     <UseWinRT>true</UseWinRT>
+    <!-- v3.6.1: System tray UI for manual launch / exit. WinForms NotifyIcon is
+         the lightest path here — Microsoft.WindowsDesktop.App is already pulled
+         in transitively by UIA so no extra runtime cost. -->
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+  <!--
+    v3.2.6: Switch from explicit <Reference HintPath> to FrameworkReference.
+    The v3.2.3 approach bundled only the managed UIA DLLs (UIAutomationClient.dll,
+    UIAutomationTypes.dll, WindowsBase.dll) into the single-file exe — but those
+    DLLs also reference WPF native helpers (Native.dll, PresentationNative_cor3.dll)
+    at runtime. Those native helpers live in the Microsoft.WindowsDesktop.App
+    runtime pack and were dropped by self-contained single-file publish without
+    a FrameworkReference. Symptom: every getStatus call logged
+    `EXCEPTION: type=FileNotFoundException` from inside AutomationElement.RootElement.
+
+    Fix: declare the framework reference so the publish step copies the runtime
+    pack's native DLLs alongside the exe (or into the bundle). Trade: exe grows
+    from ~157MB to ~210MB because the whole WPF/WinForms runtime ships.
+    We never instantiate WPF/WinForms types — the footprint is purely transitive
+    WindowsBase dependency. Worth paying to make UIA actually work so lyric
+    sync has a real position source instead of relying on the virtual clock.
+  -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
+  </ItemGroup>
 
 </Project>

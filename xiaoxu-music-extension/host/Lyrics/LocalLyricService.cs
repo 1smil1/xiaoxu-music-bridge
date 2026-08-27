@@ -1,3 +1,4 @@
+using xiaoxu_music_bridge.Common;
 using xiaoxu_music_bridge.Media;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -45,10 +46,8 @@ public sealed class LocalLyricService
             return cached;
         }
 
-        var logPath = @"C:\Users\nuaa_xuzike\xiaoxu-debug.log";
-
         var onlineLyrics = await SearchQqMusicAsync(status, cancellationToken);
-        File.AppendAllText(logPath, $"[{DateTime.Now:HH:mm:ss}] Lyrics: QQ result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
+        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: QQ result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
         if (onlineLyrics is not null)
         {
             _cache[cacheKey] = onlineLyrics;
@@ -56,7 +55,7 @@ public sealed class LocalLyricService
         }
 
         onlineLyrics = await SearchNeteaseAsync(status, cancellationToken);
-        File.AppendAllText(logPath, $"[{DateTime.Now:HH:mm:ss}] Lyrics: Netease result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
+        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: Netease result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
         if (onlineLyrics is not null)
         {
             _cache[cacheKey] = onlineLyrics;
@@ -64,7 +63,7 @@ public sealed class LocalLyricService
         }
 
         onlineLyrics = await SearchLrclibAsync(status, cancellationToken);
-        File.AppendAllText(logPath, $"[{DateTime.Now:HH:mm:ss}] Lyrics: LRCLIB result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
+        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: LRCLIB result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
         if (onlineLyrics is not null)
         {
             _cache[cacheKey] = onlineLyrics;
