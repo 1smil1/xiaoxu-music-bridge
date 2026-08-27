@@ -13,28 +13,35 @@ public sealed class WindowsMediaSessionService : IMediaSessionService
 
     public async Task<MediaStatus> GetStatusAsync(CancellationToken cancellationToken)
     {
-        var session = await GetTargetSessionAsync();
-        if (session is null)
+        GlobalSystemMediaTransportControlsSession? session = null;
+        try
         {
+            session = await GetTargetSessionAsync();
+            if (session is null) return MediaStatus.NoMedia();
+
+            var mediaProperties = await session.TryGetMediaPropertiesAsync();
+            var playbackInfo = session.GetPlaybackInfo();
+            var timeline = session.GetTimelineProperties();
+            var hasCover = mediaProperties.Thumbnail is not null;
+
+            return new MediaStatus(
+                Connected: true,
+                Source: NormalizeSource(session.SourceAppUserModelId),
+                Title: EmptyToNull(mediaProperties.Title),
+                Artist: EmptyToNull(mediaProperties.Artist),
+                Album: EmptyToNull(mediaProperties.AlbumTitle),
+                CoverUrl: hasCover ? CoverUrl : null,
+                IsPlaying: playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing,
+                PositionMs: ToMilliseconds(timeline.Position),
+                DurationMs: ToMilliseconds(timeline.EndTime),
+                UpdatedAt: DateTimeOffset.Now);
+        }
+        catch (Exception ex)
+        {
+            File.AppendAllText(@"C:\Users\nuaa_xuzike\xiaoxu-debug.log",
+                $"[{DateTime.Now:HH:mm:ss}] GetStatusAsync EXCEPTION: {ex.GetType().Name}: {ex.Message}\n");
             return MediaStatus.NoMedia();
         }
-
-        var mediaProperties = await session.TryGetMediaPropertiesAsync();
-        var playbackInfo = session.GetPlaybackInfo();
-        var timeline = session.GetTimelineProperties();
-        var hasCover = mediaProperties.Thumbnail is not null;
-
-        return new MediaStatus(
-            Connected: true,
-            Source: NormalizeSource(session.SourceAppUserModelId),
-            Title: EmptyToNull(mediaProperties.Title),
-            Artist: EmptyToNull(mediaProperties.Artist),
-            Album: EmptyToNull(mediaProperties.AlbumTitle),
-            CoverUrl: hasCover ? CoverUrl : null,
-            IsPlaying: playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing,
-            PositionMs: ToMilliseconds(timeline.Position),
-            DurationMs: ToMilliseconds(timeline.EndTime),
-            UpdatedAt: DateTimeOffset.Now);
     }
 
     public async Task<ControlResult> SendCommandAsync(ControlCommand command, CancellationToken cancellationToken)
@@ -59,34 +66,84 @@ public sealed class WindowsMediaSessionService : IMediaSessionService
 
     public async Task<CoverImage?> GetCurrentCoverAsync(CancellationToken cancellationToken)
     {
-        var session = await GetTargetSessionAsync();
-        if (session is null)
+        GlobalSystemMediaTransportControlsSession? session = null;
+        try
         {
+            session = await GetTargetSessionAsync();
+            if (session is null) return null;
+
+            var mediaProperties = await session.TryGetMediaPropertiesAsync();
+            if (mediaProperties.Thumbnail is null) return null;
+
+            await using var stream = (await mediaProperties.Thumbnail.OpenReadAsync()).AsStreamForRead();
+            using var memory = new MemoryStream();
+            await stream.CopyToAsync(memory, cancellationToken);
+
+            var bytes = memory.ToArray();
+            return bytes.Length == 0 ? null : new CoverImage(bytes, "image/jpeg");
+        }
+        catch (Exception ex)
+        {
+            // COMException from OpenReadAsync() can corrupt WinRT state for the entire process.
+            // Catch it here so the exception doesn't propagate and break subsequent calls.
+            File.AppendAllText(@"C:\Users\nuaa_xuzike\xiaoxu-debug.log",
+                $"[{DateTime.Now:HH:mm:ss}] GetCurrentCoverAsync EXCEPTION: {ex.GetType().Name}: {ex.Message}\n");
             return null;
         }
-
-        var mediaProperties = await session.TryGetMediaPropertiesAsync();
-        if (mediaProperties.Thumbnail is null)
-        {
-            return null;
-        }
-
-        await using var stream = (await mediaProperties.Thumbnail.OpenReadAsync()).AsStreamForRead();
-        using var memory = new MemoryStream();
-        await stream.CopyToAsync(memory, cancellationToken);
-
-        var bytes = memory.ToArray();
-        return bytes.Length == 0 ? null : new CoverImage(bytes, "image/jpeg");
     }
 
     private static async Task<GlobalSystemMediaTransportControlsSession?> GetTargetSessionAsync()
     {
-        var manager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-        var sessions = manager.GetSessions();
+        // GlobalSystemMediaTransportControlsSessionManager.RequestAsync() can hang forever
+        // after a COMException corrupts the WinRT state. Add retry logic with timeouts
+        // so we can recover without requiring a Windows restart.
+        const int maxRetries = 3;
+        const int retryDelayMs = 1000;
 
-        return sessions.FirstOrDefault(IsLikelyQqMusicSession)
-            ?? manager.GetCurrentSession()
-            ?? sessions.FirstOrDefault();
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                var managerTask = GlobalSystemMediaTransportControlsSessionManager.RequestAsync().AsTask();
+                var winner = await Task.WhenAny(managerTask, Task.Delay(TimeSpan.FromSeconds(3)));
+
+                if (winner != managerTask)
+                {
+                    File.AppendAllText(@"C:\Users\nuaa_xuzike\xiaoxu-debug.log",
+                        $"[{DateTime.Now:HH:mm:ss}] GetTargetSessionAsync TIMEOUT (attempt {attempt}/{maxRetries})\n");
+
+                    if (attempt < maxRetries)
+                    {
+                        await Task.Delay(retryDelayMs);
+                        continue;
+                    }
+
+                    return null;
+                }
+
+                var manager = await managerTask;
+                var sessions = manager.GetSessions();
+
+                return sessions.FirstOrDefault(IsLikelyQqMusicSession)
+                    ?? manager.GetCurrentSession()
+                    ?? sessions.FirstOrDefault();
+            }
+            catch (Exception ex)
+            {
+                File.AppendAllText(@"C:\Users\nuaa_xuzike\xiaoxu-debug.log",
+                    $"[{DateTime.Now:HH:mm:ss}] GetTargetSessionAsync EXCEPTION (attempt {attempt}/{maxRetries}): {ex.GetType().Name}: {ex.Message}\n");
+
+                if (attempt < maxRetries)
+                {
+                    await Task.Delay(retryDelayMs);
+                    continue;
+                }
+
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private static bool IsLikelyQqMusicSession(GlobalSystemMediaTransportControlsSession session)

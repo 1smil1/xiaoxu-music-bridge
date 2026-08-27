@@ -71,6 +71,37 @@ app.MapGet("/lyrics/current", async (
     return await lyricService.GetCurrentLyricsAsync(status, cancellationToken);
 });
 
+// Arbitrary-song lyrics lookup for listen-together guests. The host's
+// LiveKit frames carry song title/artist/duration; the guest forwards them
+// here, and the same LocalLyricService chain (local LRC → QQ Music →
+// NetEase → lrclib) returns the result. The browser does not replicate the
+// multi-source fallback in JS — it just consumes this endpoint on its own
+// local bridge instance.
+app.MapGet("/lyrics/query", async (
+    string? title,
+    string? artist,
+    long? durationMs,
+    LocalLyricService lyricService,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(title))
+    {
+        return Results.BadRequest(new { error = "title is required" });
+    }
+    var status = new MediaStatus(
+        Connected: true,
+        Source: "listen-together-guest",
+        Title: title,
+        Artist: string.IsNullOrWhiteSpace(artist) ? null : artist,
+        Album: null,
+        CoverUrl: null,
+        IsPlaying: false,
+        PositionMs: 0,
+        DurationMs: durationMs ?? 0,
+        UpdatedAt: DateTimeOffset.Now);
+    return Results.Ok(await lyricService.GetCurrentLyricsAsync(status, cancellationToken));
+});
+
 app.MapPost("/control/play-pause", async (IMediaSessionService mediaSessionService, CancellationToken cancellationToken) =>
     ToHttpResult(await mediaSessionService.SendCommandAsync(ControlCommand.PlayPause, cancellationToken)));
 
