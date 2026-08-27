@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -235,7 +236,6 @@ if (beatService is null)
 // without ever reaching this code.
 var statusForm = new StatusForm(
     hostPid,
-    hostStartedAt,
     endpointSettings,
     () => gsmtcService.GetStatusAsync(CancellationToken.None));
 
@@ -274,8 +274,15 @@ LogPaths.SafeAppend(LogPaths.DebugLog,
 
 static void ShowStatusWindow(Form form)
 {
-    if (!form.Visible) form.Show();
-    if (form.WindowState == FormWindowState.Minimized) form.WindowState = FormWindowState.Normal;
+    // Force the OS-level WS_VISIBLE bit on. The earlier
+    // `if (!form.Visible) form.Show();` guard could no-op when the form's
+    // managed Visible state and Win32 WS_VISIBLE drifted apart (e.g. after a
+    // stray FormClosing event). ShowWindow(SW_RESTORE) unconditionally
+    // surfaces the window, then BringToFront + Activate hands it focus.
+    if (form.WindowState == FormWindowState.Minimized)
+        form.WindowState = FormWindowState.Normal;
+    form.Show();
+    Win32.ShowWindow(form.Handle, Win32.SW_RESTORE);
     form.BringToFront();
     form.Activate();
 }
@@ -1196,4 +1203,13 @@ catch (Exception ex)
 {
     LogPaths.SafeAppend(LogPaths.DebugLog,
         $"[{DateTime.Now:HH:mm:ss}] FATAL: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}\n");
+}
+
+internal static class Win32
+{
+    public const int SW_RESTORE = 9;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }

@@ -30,7 +30,6 @@ public sealed class StatusForm : Form
 
     public StatusForm(
         int pid,
-        DateTimeOffset startedAt,
         BridgeEndpointSettings endpoint,
         Func<Task<MediaStatus>> statusProbe)
     {
@@ -61,7 +60,7 @@ public sealed class StatusForm : Form
         };
         _pidLabel = new Label
         {
-            Text = $"PID: {pid}    已运行: {FormatUptime(DateTimeOffset.Now - startedAt)}",
+            Text = $"PID: {pid}",
             Location = new Point(16, 70),
             AutoSize = true,
             ForeColor = Color.FromArgb(80, 80, 80),
@@ -159,13 +158,5 @@ public sealed class StatusForm : Form
             _statusLabel.Text = $"QQ 音乐: 错误 ({ex.GetType().Name})";
             _statusLabel.ForeColor = Color.Crimson;
         }
-    }
-
-    private static string FormatUptime(TimeSpan elapsed)
-    {
-        if (elapsed.TotalSeconds < 60) return $"{(int)elapsed.TotalSeconds} 秒";
-        if (elapsed.TotalMinutes < 60) return $"{(int)elapsed.TotalMinutes} 分 {(int)elapsed.Seconds} 秒";
-        if (elapsed.TotalHours < 24) return $"{(int)elapsed.TotalHours} 小时 {(int)elapsed.Minutes} 分";
-        return $"{(int)elapsed.TotalDays} 天 {(int)elapsed.Hours} 小时";
     }
 }

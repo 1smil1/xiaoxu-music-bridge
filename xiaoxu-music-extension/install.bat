@@ -84,7 +84,7 @@ echo.
 
 :: Step 4: Create desktop shortcut to host exe
 echo  [5/5] Creating desktop shortcut ...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = (New-Object -COM WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop') + '\xiaoxu-music-bridge.lnk'); $s.TargetPath = '%INSTALL_DIR%\xiaoxu-music-host.exe'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.IconLocation = '%INSTALL_DIR%\xiaoxu-music-host.exe,0'; $s.Description = 'xiaoxu-music-bridge - 双击启动，右键托盘可退出'; $s.Save()" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = (New-Object -COM WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop') + '\xiaoxu-music-bridge.lnk'); $s.TargetPath = '%INSTALL_DIR%\xiaoxu-music-host.exe'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.IconLocation = '%INSTALL_DIR%\xiaoxu-music-host.exe,0'; $s.Description = 'xiaoxu-music-bridge host (double-click to launch; right-click tray for Exit)'; $s.Save()" >nul 2>&1
 if %errorlevel% neq 0 (
     echo  [5/5] FAILED - PowerShell error
     echo.

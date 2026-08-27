@@ -69,6 +69,22 @@ function sendToHost(message) {
 // NOTE: sendResponse passes the native host response object directly (no JSON.stringify)
 // to avoid Chrome's sendMessage string-in-object truncation issue.
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // "kick" — content script asks background to ensure the native host is
+  // running. sendNativeMessage forces Chrome to spawn the host (NativeMessaging
+  // mode). The host reads this message, calls EnsureServerAsync which spawns
+  // `host.exe --server` if no server is healthy yet, and exits. The spawned
+  // --server instance keeps the mutex and runs Kestrel + tray.
+  if (message.type === 'kick') {
+    chrome.runtime.sendNativeMessage(HOST_NAME, { type: 'ensureServer' }, (response) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      sendResponse({ ok: true, data: response });
+    });
+    return true;
+  }
+
   if (message.type !== 'bridgeRequest') return false;
 
   const url = message.url || '';
