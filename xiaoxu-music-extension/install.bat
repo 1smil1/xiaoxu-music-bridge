@@ -51,35 +51,47 @@ echo  [1/4] Install path: %INSTALL_DIR%
 echo.
 
 :: Step 1: Kill existing host process
-echo  [2/4] Killing existing host process...
+echo  [2/5] Killing existing host process...
 taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
-echo  [2/4] OK
+echo  [2/5] OK
 echo.
 
 :: Step 2: Generate host manifest (ConvertTo-Json handles backslash escaping)
-echo  [3/4] Generating xiaoxu_music_host.json ...
+echo  [3/5] Generating xiaoxu_music_host.json ...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$j = @{name='xiaoxu_music_host';description='xiaoxu-music-bridge native messaging host';path='%INSTALL_DIR%\xiaoxu-music-host.exe';type='stdio';allowed_origins=@('chrome-extension://%EXT_ID%/')} | ConvertTo-Json -Compress; [System.IO.File]::WriteAllText('%INSTALL_DIR%\xiaoxu_music_host.json', $j)" >nul 2>&1
 if %errorlevel% neq 0 (
-    echo  [3/4] FAILED - PowerShell error
+    echo  [3/5] FAILED - PowerShell error
     echo.
     pause
     exit /b 1
 )
 
 if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
-    echo  [3/4] FAILED - json file not created
+    echo  [3/5] FAILED - json file not created
     echo.
     pause
     exit /b 1
 )
-echo  [3/4] OK
+echo  [3/5] OK
 echo.
 
 :: Step 3: Write registry
-echo  [4/4] Writing registry ...
+echo  [4/5] Writing registry ...
 reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
 reg add "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
-echo  [4/4] OK (HKCU + HKLM)
+echo  [4/5] OK (HKCU + HKLM)
+echo.
+
+:: Step 4: Create desktop shortcut to host exe
+echo  [5/5] Creating desktop shortcut ...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = (New-Object -COM WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop') + '\xiaoxu-music-bridge.lnk'); $s.TargetPath = '%INSTALL_DIR%\xiaoxu-music-host.exe'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.IconLocation = '%INSTALL_DIR%\xiaoxu-music-host.exe,0'; $s.Description = 'xiaoxu-music-bridge - 双击启动，右键托盘可退出'; $s.Save()" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo  [5/5] FAILED - PowerShell error
+    echo.
+    pause
+    exit /b 1
+)
+echo  [5/5] OK (desktop shortcut created)
 echo.
 
 :: Step 4: Restart Chrome

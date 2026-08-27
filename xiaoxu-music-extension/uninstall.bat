@@ -31,6 +31,9 @@ reg delete "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" 
 reg delete "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /f >nul 2>&1
 echo  [OK] 注册表已清除 (HKCU + HKLM)
 
+:: Delete desktop shortcut created by install.bat
+del /f /q "%USERPROFILE%\Desktop\xiaoxu-music-bridge.lnk" >nul 2>&1
+
 :: Delete all files in current directory (except uninstall.bat itself)
 set "INSTALL_DIR=%~dp0"
 del /f /q "%INSTALL_DIR%\xiaoxu-music-host.exe" >nul 2>&1
