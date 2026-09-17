@@ -120,9 +120,16 @@ public sealed class ITunesCoverLookupService
     private async Task<CoverImage?> SearchAndDownloadAsync(string title, string artist, CancellationToken cancellationToken)
     {
         ITunesTrack? best = null;
+        // CN storefront first (Chinese catalog), then US — many western tracks
+        // (e.g. Avril Lavigne "Innocence") are simply absent from the CN store
+        // and would wrongly end up cached as NotFound forever.
         foreach (var query in GetSearchQueries(title, artist))
         {
-            best = await SearchForTrackAsync(query, title, artist, cancellationToken);
+            foreach (var country in new[] { "CN", "US" })
+            {
+                best = await SearchForTrackAsync(query, title, artist, country, cancellationToken);
+                if (best is not null) break;
+            }
             if (best is not null) break;
         }
 
@@ -150,10 +157,10 @@ public sealed class ITunesCoverLookupService
         return bytes is null ? null : new CoverImage(bytes, "image/jpeg");
     }
 
-    private async Task<ITunesTrack?> SearchForTrackAsync(string query, string title, string artist, CancellationToken cancellationToken)
+    private async Task<ITunesTrack?> SearchForTrackAsync(string query, string title, string artist, string country, CancellationToken cancellationToken)
     {
         // Encode the whole term — iTunes 400s on raw mixed CJK + punctuation.
-        var searchUrl = $"https://itunes.apple.com/search?term={Uri.EscapeDataString(query)}&entity=song&country=CN&limit=10";
+        var searchUrl = $"https://itunes.apple.com/search?term={Uri.EscapeDataString(query)}&entity=song&country={country}&limit=10";
 
         ITunesSearchResponse? search;
         try
@@ -162,7 +169,7 @@ public sealed class ITunesCoverLookupService
             request.Headers.UserAgent.ParseAdd("Mozilla/5.0");
             using var response = await _httpClient.SendAsync(request, cancellationToken);
             LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [iTunes] search query='{query}' status={(int)response.StatusCode}\n");
+                $"[{DateTime.Now:HH:mm:ss}] [iTunes] search query='{query}' country={country} status={(int)response.StatusCode}\n");
             if (!response.IsSuccessStatusCode) return null;
 
             search = JsonSerializer.Deserialize<ITunesSearchResponse>(
