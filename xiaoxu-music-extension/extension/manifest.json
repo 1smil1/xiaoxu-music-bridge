@@ -11,7 +11,8 @@
     "*://xiaoxu.xin/*",
     "*://localhost/*",
     "*://xiaoxu-blog-dun.vercel.app/*",
-    "*://ppt2html.xin/*"
+    "*://ppt2html.xin/*",
+    "*://xmoyue.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -22,7 +23,8 @@
         "*://xiaoxu.xin/*",
         "*://localhost/*",
         "*://xiaoxu-blog-dun.vercel.app/*",
-        "*://ppt2html.xin/*"
+        "*://ppt2html.xin/*",
+        "*://xmoyue.com/*"
       ],
       "js": [
         "content.js"
@@ -39,7 +41,8 @@
         "*://xiaoxu.xin/*",
         "*://localhost/*",
         "*://xiaoxu-blog-dun.vercel.app/*",
-        "*://ppt2html.xin/*"
+        "*://ppt2html.xin/*",
+        "*://xmoyue.com/*"
       ]
     }
   ],

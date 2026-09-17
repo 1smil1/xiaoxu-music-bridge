@@ -9,6 +9,8 @@ public static class AudioStreamOriginPolicy
         "http://xiaoxu.xin",
         "https://xiaoxu.xin",
         "https://xiaoxu-blog-dun.vercel.app",
+        "http://xmoyue.com",
+        "https://xmoyue.com",
         "http://ppt2html.xin",
         "https://ppt2html.xin",
         "http://localhost:5173",
