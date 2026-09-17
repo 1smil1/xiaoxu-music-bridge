@@ -51,7 +51,7 @@ namespace xiaoxu_music_bridge.Bridge;
 
 public sealed class BridgeHttpServer : IDisposable
 {
-    public const string HostVersion = "3.6.5";
+    public const string HostVersion = "3.6.6";
     private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
 
     private const string AllowMethods = "GET, PUT, POST, OPTIONS";
@@ -612,6 +612,13 @@ public sealed class BridgeHttpServer : IDisposable
         ITunesCoverLookupService? itunes;
         lock (_coverLock) { qq = _qqCover; itunes = _itunesCover; }
 
+        // Tier 0: the playing app's own GSMT thumbnail — always matches the
+        // actual track, including translated/romanized titles no catalog
+        // search can score (e.g. しろつめくさ → "White Clover").
+        var (gsmtCover, gsmtTimedOut, _) = await WithTimeout(
+            _gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GsmtCoverState");
+        if (!gsmtTimedOut && gsmtCover is not null) cover = gsmtCover;
+
         // v3.2.5: Single-source timeouts reduced from 5s → 3s. Cover + lyrics
         // now run in parallel (Task.WhenAll in BuildStateResponseAsync), so
         // the /state/current total budget is max(cover, lyrics) ≈ 3s, well
@@ -665,6 +672,10 @@ public sealed class BridgeHttpServer : IDisposable
         lock (_coverLock) { qq = _qqCover; itunes = _itunesCover; }
 
         CoverImage? cover = null;
+        // Tier 0: GSMT thumbnail (see ResolveCoverDataUrlAsync).
+        var (gsmtCover, gsmtTimedOut, _) = await WithTimeout(
+            _gsmtc.GetCurrentCoverAsync(CancellationToken.None), 1500, "GsmtCoverDirect");
+        if (!gsmtTimedOut && gsmtCover is not null) cover = gsmtCover;
         if (qq != null)
         {
             var (c, _, _) = await WithTimeout(

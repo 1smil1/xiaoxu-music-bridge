@@ -130,15 +130,21 @@ public sealed class QqMusicCoverLookupService
             return null;
         }
 
-        // Try 500x500 first, fallback to 300x300
-        var url500 = $"https://y.gtimg.cn/music/photo_new/T002R500x500M{albummid}_1.jpg";
-        byte[]? bytes = await DownloadCoverAsync(url500, cancellationToken);
-        if (bytes is null)
+        // Some albums 404 on the canonical _1 sizes; try the CDN ladder
+        // (_2 = alternate art, 90x90 = tiny variant, imgcache = legacy mirror).
+        var urls = new[]
         {
-            var url300 = $"https://y.gtimg.cn/music/photo_new/T002R300x300M{albummid}_1.jpg";
-            LogPaths.SafeAppend(LogPaths.DebugLog,
-                $"[{DateTime.Now:HH:mm:ss}] [QQCover] 500x500 miss, trying 300x300 albummid={albummid}\n");
-            bytes = await DownloadCoverAsync(url300, cancellationToken);
+            $"https://y.gtimg.cn/music/photo_new/T002R500x500M{albummid}_1.jpg",
+            $"https://y.gtimg.cn/music/photo_new/T002R300x300M{albummid}_1.jpg",
+            $"https://y.gtimg.cn/music/photo_new/T002R500x500M{albummid}_2.jpg",
+            $"https://y.gtimg.cn/music/photo_new/T002R90x90M{albummid}_1.jpg",
+            $"https://imgcache.qq.com/music/photo_new/T002R500x500M{albummid}_1.jpg",
+        };
+        byte[]? bytes = null;
+        foreach (var url in urls)
+        {
+            bytes = await DownloadCoverAsync(url, cancellationToken);
+            if (bytes is not null) break;
         }
 
         return bytes is null ? null : new CoverImage(bytes, "image/jpeg");
