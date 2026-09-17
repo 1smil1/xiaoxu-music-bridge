@@ -8,7 +8,10 @@
     "storage"
   ],
   "host_permissions": [
-    "*://xiaoxu.xin/*"
+    "*://xiaoxu.xin/*",
+    "*://localhost/*",
+    "*://xiaoxu-blog-dun.vercel.app/*",
+    "*://ppt2html.xin/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -16,16 +19,28 @@
   "content_scripts": [
     {
       "matches": [
-        "*://xiaoxu.xin/*"
+        "*://xiaoxu.xin/*",
+        "*://localhost/*",
+        "*://xiaoxu-blog-dun.vercel.app/*",
+        "*://ppt2html.xin/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected.js"],
-      "matches": ["*://xiaoxu.xin/*"]
+      "resources": [
+        "injected.js"
+      ],
+      "matches": [
+        "*://xiaoxu.xin/*",
+        "*://localhost/*",
+        "*://xiaoxu-blog-dun.vercel.app/*",
+        "*://ppt2html.xin/*"
+      ]
     }
   ],
   "icons": {
