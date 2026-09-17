@@ -51,7 +51,7 @@ namespace xiaoxu_music_bridge.Bridge;
 
 public sealed class BridgeHttpServer : IDisposable
 {
-    public const string HostVersion = "3.6.2";
+    public const string HostVersion = "3.6.3";
     private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
 
     private const string AllowMethods = "GET, PUT, POST, OPTIONS";
