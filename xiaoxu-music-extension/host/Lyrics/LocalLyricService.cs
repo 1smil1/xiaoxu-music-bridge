@@ -46,16 +46,21 @@ public sealed class LocalLyricService
             return cached;
         }
 
-        var onlineLyrics = await SearchQqMusicAsync(status, cancellationToken);
-        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: QQ result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
+        // v3.6.7: Netease is now the first online source — it's the only
+        // provider that returns word-level YRC karaoke timing, and the
+        // dashboard prefers YRC over LRC when both are present. QQ
+        // (direct + ygking fallback) and LRClib are line-level only and
+        // remain as fallback tiers below.
+        var onlineLyrics = await SearchNeteaseAsync(status, cancellationToken);
+        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: Netease result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
         if (onlineLyrics is not null)
         {
             _cache[cacheKey] = onlineLyrics;
             return onlineLyrics;
         }
 
-        onlineLyrics = await SearchNeteaseAsync(status, cancellationToken);
-        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: Netease result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
+        onlineLyrics = await SearchQqMusicAsync(status, cancellationToken);
+        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: QQ result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
         if (onlineLyrics is not null)
         {
             _cache[cacheKey] = onlineLyrics;
@@ -392,7 +397,10 @@ public sealed class LocalLyricService
             return null;
         }
 
-        var lyricUrl = $"https://music.163.com/api/song/lyric?id={best.Id}&lv=1&kv=1&tv=-1";
+        // tv=1 (was -1) so Netease returns both `lrc` (line-level) and `yrc`
+        // (word-level karaoke). v3.6.7: prefer yrc when available so the
+        // dashboard can render per-character highlights.
+        var lyricUrl = $"https://music.163.com/api/song/lyric?id={best.Id}&lv=1&kv=1&tv=1";
         NeteaseLyricResponse? lyric;
         try
         {
@@ -417,14 +425,21 @@ public sealed class LocalLyricService
             return null;
         }
 
+        // YRC is the Netease word-level payload ([lineStart,lineDur]<char
+        // offset,dur>char<...>). Empty / null falls back to line-level LRC
+        // — dashboard parser picks the richer one automatically.
+        var yrc = lyric?.Yrc?.Lyric;
+        var source = !string.IsNullOrWhiteSpace(yrc) ? "netease-yrc" : "netease";
+
         return new LyricResponse(
             true,
             status.Title,
             status.Artist,
             $"{string.Join("/", best.Artists.Select(artist => artist.Name))} - {best.Name}",
             lrc,
-            "netease",
-            true);
+            source,
+            true,
+            yrc);
     }
 
     private static int Score(NeteaseSong song, string title, string artist, long durationMs)
@@ -620,7 +635,9 @@ public sealed class LocalLyricService
         [property: JsonPropertyName("name")] string Name);
 
     private sealed record NeteaseLyricResponse(
-        [property: JsonPropertyName("lrc")] NeteaseLyric? Lrc);
+        [property: JsonPropertyName("lrc")] NeteaseLyric? Lrc,
+        [property: JsonPropertyName("yrc")] NeteaseLyric? Yrc,
+        [property: JsonPropertyName("tlyric")] NeteaseLyric? TLyric);
 
     private sealed record NeteaseLyric(
         [property: JsonPropertyName("lyric")] string? Lyric);
