@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
@@ -29,6 +30,17 @@ if (args.Contains("--restart-gsmtc-services", StringComparer.OrdinalIgnoreCase))
 {
     Environment.Exit(GsmtcRecoveryService.RestartAudioServicesElevatedHelper());
     return;
+}
+
+// v3.6.7: if a parent set --recovery-respawn=N before dying, log it so
+// post-mortem can correlate child crashes back to the parent's exit. We
+// do NOT skip any startup logic — the watchdog already has a 15s grace via
+// hostStartedAt in the isHealthy predicate.
+var recoveryRespawnArg = args.FirstOrDefault(a => a.StartsWith("--recovery-respawn=", StringComparison.OrdinalIgnoreCase));
+if (recoveryRespawnArg is not null)
+{
+    LogPaths.SafeAppend(LogPaths.DebugLog,
+        $"[{DateTime.Now:HH:mm:ss}] HOST SPAWNED FROM PARENT RECOVERY ({recoveryRespawnArg})\n");
 }
 
 try
@@ -227,6 +239,20 @@ if (beatService is null)
         $"[{DateTime.Now:HH:mm:ss}] AudioBeatService STARTED at host startup\n");
 }
 
+// v3.6.7: host-recovery lambdas above need a mutable reference into the
+// beat service so the watchdog can dispose+restart it. We alias the local
+// field through a wrapper the recovery code can read/write by closure.
+// `lastPlayingClaim` is updated by the playback-state endpoint so the
+// watchdog can tell "playing-but-capture-not-ready" apart from "idle-and-
+// capture-not-ready" — only the former is a hang.
+AudioBeatService beatServiceRef = beatService;
+
+// Set to true by the tray Exit menu / StatusForm 退出 button so we don't
+// auto-respawn when the user actually wants to quit. Application.Run
+// returning without this flag set = unexpected exit (stdin EOF, native
+// pipe broken, tray loop glitch) → respawn.
+bool userInitiatedShutdown = false;
+
 // v3.6.1: System tray UI so the user can launch / exit the host manually
 // instead of relying on the Chrome extension. The previous `Task.Delay(Infinite)`
 // blocked forever with no UI affordance; replacing it with `Application.Run()`
@@ -246,6 +272,79 @@ using var trayIcon = new NotifyIcon
     Visible = true,
 };
 
+// v3.6.7: self-recovery plumbing — WASAPI device-change listener +
+// silence/capture-ready watchdog + silent respawn on unexpected exit.
+// Real fix for the "stdin EOF → host exits → dashboard freezes on white"
+// loop the user hit on every Chrome reload. All three guards are off if
+// the user passes --no-recovery; crash-loop watchdog is more aggressive
+// than the capture watchdog so a wedged capture does not pin us in a
+// tight restart loop.
+var recoveryDisabled = args.Any(a => a.Equals("--no-recovery", StringComparison.OrdinalIgnoreCase));
+var recoveryOpts = new HostRecoveryOptions(
+    EnableRespawn: !recoveryDisabled,
+    EnableSilenceWatchdog: !recoveryDisabled,
+    WatchdogIntervalSec: 5.0,
+    SilenceThresholdSec: 30.0,
+    MaxRespawnsInWindow: 5,
+    RespawnWindowSec: 60.0);
+
+var recovery = new HostRecovery(
+    originalArgs: args,
+    exePath: Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "xiaoxu-music-host.exe",
+    options: recoveryOpts,
+    isHealthy: () =>
+    {
+        // Capture not ready AND we've been "alive" for at least the grace
+        // window = hung WASAPI capture. Pre-grace we always return healthy
+        // so the watchdog doesn't fire on the initial start.
+        var beat = beatServiceRef;
+        if (beat is null) return true;
+        if (beat.IsCaptureReady) return true;
+        return hostStartedAt == default || (DateTimeOffset.Now - hostStartedAt).TotalSeconds < 15.0;
+    },
+    restartCapture: () =>
+    {
+        var beat = beatServiceRef;
+        if (beat is null) return;
+        try { beat.Dispose(); } catch { }
+        // Reconstruct via the same factory we used on startup; this re-uses
+        // the JsonWriter delegate so the http bridge keeps getting frames.
+        beatServiceRef = new AudioBeatService(json => WriteMessage(stdout, json, stdoutLock));
+        beatServiceRef.Start();
+        if (debugServer is not null)
+        {
+            beatServiceRef.AttachDebugServer(debugServer);
+            debugServer.SetBeatService(beatServiceRef);
+        }
+        bridgeHttp.SetBeatService(beatServiceRef);
+    },
+    log: msg => LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss.fff}] {msg}\n"));
+recovery.Start();
+
+// WASAPI default-device monitor — when the user unplugs the headset mid-
+// playback, the loopback capture silently dies. IMMNotificationClient +
+// capture-restart above is the recovery path.
+WasapiDeviceMonitor? deviceMonitor = null;
+if (!recoveryDisabled && beatService is not null)
+{
+    deviceMonitor = new WasapiDeviceMonitor(
+        restartCapture: () =>
+        {
+            var beat = beatServiceRef;
+            if (beat is null) return;
+            try { beat.Dispose(); } catch { }
+            beatServiceRef = new AudioBeatService(json => WriteMessage(stdout, json, stdoutLock));
+            beatServiceRef.Start();
+            if (debugServer is not null)
+            {
+                beatServiceRef.AttachDebugServer(debugServer);
+                debugServer.SetBeatService(beatServiceRef);
+            }
+            bridgeHttp.SetBeatService(beatServiceRef);
+        },
+        log: msg => LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss.fff}] {msg}\n"));
+}
+
 var trayMenu = new ContextMenuStrip();
 var showItem = new ToolStripMenuItem("显示窗口");
 showItem.Click += (_, _) => ShowStatusWindow(statusForm);
@@ -254,6 +353,7 @@ trayMenu.Items.Add(new ToolStripSeparator());
 var exitItem = new ToolStripMenuItem("退出");
 exitItem.Click += (_, _) =>
 {
+    userInitiatedShutdown = true;
     trayIcon.Visible = false;
     statusForm.Close();
     Application.Exit();
@@ -270,7 +370,28 @@ LogPaths.SafeAppend(LogPaths.DebugLog,
 Application.Run();
 
 LogPaths.SafeAppend(LogPaths.DebugLog,
-    $"[{DateTime.Now:HH:mm:ss}] Application.Run returned; host shutting down\n");
+    $"[{DateTime.Now:HH:mm:ss}] Application.Run returned; evaluating shutdown reason\n");
+
+// v3.6.7: when Application.Run returns UNEXPECTEDLY (stdin EOF, native
+// message pipe broken, unhandled exception in tray loop), prefer silent
+// respawn over exit. The user is mid-listening; the dashboard's bridge HTTP
+// just dropped — if we exit, the particle visualizer freezes until they
+// notice and re-launch. Tray menu Exit() / StatusForm 退出 path sets
+// `userInitiatedShutdown = true` so we don't respawn from that.
+if (!userInitiatedShutdown)
+{
+    deviceMonitor?.Dispose();
+    recovery.Dispose();
+    var respawned = recovery.TryRespawnOnUnexpectedExit("Application.Run returned");
+    if (!respawned)
+    {
+        // Crash-loop guard tripped, or respawn disabled — exit normally.
+        return;
+    }
+    // Brief pause so the child can bind the listening socket before we go.
+    Thread.Sleep(500);
+    return;
+}
 
 static void ShowStatusWindow(Form form)
 {
