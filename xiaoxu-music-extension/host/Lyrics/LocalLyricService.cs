@@ -75,6 +75,19 @@ public sealed class LocalLyricService
             return onlineLyrics;
         }
 
+        // v3.6.8: AMLL TTML DB as last-resort fallback. Word-level karaoke
+        // timing sourced from a community-maintained mirror of Apple Music
+        // lyric files (amll-ttml-db.stevexmh.net). Only useful for songs
+        // that someone has uploaded — most tracks return 404. We try
+        // Netease first (most coverage), then QQ.
+        onlineLyrics = await SearchAmllDbAsync(status, cancellationToken);
+        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: AMLLDB result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
+        if (onlineLyrics is not null)
+        {
+            _cache[cacheKey] = onlineLyrics;
+            return onlineLyrics;
+        }
+
         return new LyricResponse(false, status.Title, status.Artist, null, null);
     }
 
@@ -151,6 +164,121 @@ public sealed class LocalLyricService
             lrc,
             synced ? "lrclib-synced" : "lrclib-plain",
             synced);
+    }
+
+    // v3.6.8: AMLL TTML DB word-level fallback.
+    // The DB lives at https://amll-ttml-db.stevexmh.net and exposes TTML
+    // files under /{platform}/{musicId}?format=ttml. Platforms: 'ncm'
+    // (Netease), 'qq'. Songs must be uploaded by the community to exist
+    // in the mirror — most tracks 404. We always try Netease first since
+    // the DB has heavier Netease coverage, then QQ as a fallback. Search
+    // by title+artist returns the music ID we need to construct the URL.
+    private async Task<LyricResponse?> SearchAmllDbAsync(MediaStatus status, CancellationToken cancellationToken)
+    {
+        var title = CleanTitle(status.Title ?? "");
+        var artist = CleanArtist(status.Artist ?? "");
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return null;
+        }
+
+        var ncmId = await TryFindNeteaseIdAsync(title, artist, status.DurationMs, cancellationToken);
+        if (ncmId.HasValue && await TryFetchAmllTtmlAsync("ncm", ncmId.Value.ToString(), status, cancellationToken) is { } ncmResp)
+        {
+            return ncmResp;
+        }
+
+        // QQ lookup is more expensive (needs direct API dance). Skip for now
+        // — most AMLL DB entries are sourced from Netease anyway. Re-enable
+        // when QQ coverage on the DB grows.
+        return null;
+    }
+
+    private async Task<LyricResponse?> TryFetchAmllTtmlAsync(
+        string platform,
+        string musicId,
+        MediaStatus status,
+        CancellationToken cancellationToken)
+    {
+        var url = $"https://amll-ttml-db.stevexmh.net/{platform}/{Uri.EscapeDataString(musicId)}?format=ttml";
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            using var response = await _httpClient.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+            var ttml = await response.Content.ReadAsStringAsync(cancellationToken);
+            // AMLL DB returns 200 even for misses sometimes with empty body,
+            // so check the payload for the <tt> root.
+            if (string.IsNullOrWhiteSpace(ttml) || !ttml.Contains("<tt", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+            return new LyricResponse(
+                true,
+                status.Title,
+                status.Artist,
+                $"amll-db/{platform}/{musicId}",
+                null,
+                $"amll-db-{platform}-ttml",
+                true,
+                null,
+                ttml);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // Lightweight Netease ID lookup — calls the same web search the
+    // SearchNeteaseAsync flow uses but only returns the first hit's ID.
+    // Re-uses the existing NeteaseSearchResponse shape without parsing the
+    // full song payload.
+    private async Task<long?> TryFindNeteaseIdAsync(
+        string title,
+        string artist,
+        long durationMs,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var query = string.IsNullOrWhiteSpace(artist) ? title : $"{title} {artist}";
+            var searchUrl = $"https://music.163.com/api/search/get/web?csrf_token=&s={Uri.EscapeDataString(query)}&type=1&offset=0&limit=5";
+            using var request = new HttpRequestMessage(HttpMethod.Get, searchUrl);
+            request.Headers.Referrer = new Uri("https://music.163.com/");
+            using var response = await _httpClient.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+            NeteaseSearchResponse? search;
+            try
+            {
+                search = JsonSerializer.Deserialize<NeteaseSearchResponse>(
+                    await response.Content.ReadAsStringAsync(cancellationToken));
+            }
+            catch
+            {
+                return null;
+            }
+            var songs = search?.Result?.Songs;
+            if (songs is null || songs.Length == 0)
+            {
+                return null;
+            }
+            // Title + duration match wins, otherwise first hit. Cheap check.
+            var best = songs
+                .OrderByDescending(song => Score(song, title, artist, durationMs))
+                .FirstOrDefault();
+            return best?.Id > 0 ? best.Id : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task<LyricResponse?> SearchQqMusicAsync(MediaStatus status, CancellationToken cancellationToken)
