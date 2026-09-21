@@ -357,6 +357,7 @@ public sealed class LocalLyricService
                 continue;
             }
 
+            var qrc = await QqQrcService.FetchAsync(_httpClient, best.SongId, best.SongMid, best.Interval, cancellationToken);
             var lrc = lyric?.Lyric;
             if (string.IsNullOrWhiteSpace(lrc))
             {
@@ -369,8 +370,9 @@ public sealed class LocalLyricService
                 status.Artist,
                 $"{string.Join("/", best.Singer.Select(singer => singer.Name))} - {best.SongName}",
                 lrc,
-                "qqmusic-direct",
-                true);
+                qrc is null ? "qqmusic-direct" : "qqmusic-qrc",
+                true,
+                Qrc: qrc);
         }
 
         return null;
@@ -739,6 +741,7 @@ public sealed class LocalLyricService
         [property: JsonPropertyName("list")] QqDirectSong[] List);
 
     private sealed record QqDirectSong(
+        [property: JsonPropertyName("songid")] int SongId,
         [property: JsonPropertyName("songmid")] string SongMid,
         [property: JsonPropertyName("songname")] string SongName,
         [property: JsonPropertyName("singer")] QqSinger[] Singer,

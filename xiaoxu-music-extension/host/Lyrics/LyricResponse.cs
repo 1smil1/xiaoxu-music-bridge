@@ -23,4 +23,5 @@ public sealed record LyricResponse(
     string? Source = null,
     bool Synced = false,
     string? Yrc = null,
-    string? Ttml = null);
+    string? Ttml = null,
+    string? Qrc = null);
