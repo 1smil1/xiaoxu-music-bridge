@@ -46,21 +46,17 @@ public sealed class LocalLyricService
             return cached;
         }
 
-        // v3.6.7: Netease is now the first online source — it's the only
-        // provider that returns word-level YRC karaoke timing, and the
-        // dashboard prefers YRC over LRC when both are present. QQ
-        // (direct + ygking fallback) and LRClib are line-level only and
-        // remain as fallback tiers below.
-        var onlineLyrics = await SearchNeteaseAsync(status, cancellationToken);
-        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: Netease result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
+        // QQ is the playback authority and now supplies word-level QRC.
+        var onlineLyrics = await SearchQqMusicAsync(status, cancellationToken);
+        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: QQ result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
         if (onlineLyrics is not null)
         {
             _cache[cacheKey] = onlineLyrics;
             return onlineLyrics;
         }
 
-        onlineLyrics = await SearchQqMusicAsync(status, cancellationToken);
-        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: QQ result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
+        onlineLyrics = await SearchNeteaseAsync(status, cancellationToken);
+        LogPaths.SafeAppend(LogPaths.DebugLog, $"[{DateTime.Now:HH:mm:ss}] Lyrics: Netease result={(onlineLyrics is not null ? "FOUND" : "null")}\n");
         if (onlineLyrics is not null)
         {
             _cache[cacheKey] = onlineLyrics;
