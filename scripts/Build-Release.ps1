@@ -79,7 +79,15 @@ $extensionFiles = @(
     'reconnect-policy.js',
     'icon16.png',
     'icon48.png',
-    'icon128.png'
+    'icon128.png',
+    # web_accessible_resources entry referenced by manifest.json — leaving
+    # it out of the stage folder ships a broken extension where the dashboard
+    # fetch interceptor never loads. Reproduced 2026-09-24 after manual copy
+    # to D:\music_bridge\ did not include injected.js.
+    'injected.js',
+    # Used by chrome://extensions "Pack extension" flow to keep the same
+    # extension ID across reinstalls. Drop the file if you want a fresh ID.
+    'key.pem'
 )
 $stageExtension = Join-Path $stageRoot 'extension'
 New-Item -ItemType Directory -Path $stageExtension | Out-Null

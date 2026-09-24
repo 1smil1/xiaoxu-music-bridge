@@ -20,6 +20,11 @@ set "INSTALL_DIR=%INSTALL_DIR:~0,-1%"
 if not exist "%INSTALL_DIR%\xiaoxu-music-host.exe" (
     echo  [ERROR] xiaoxu-music-host.exe not found
     echo.
+    echo  这个安装脚本必须在已发布 (release) 的文件夹里跑。
+    echo  从源码部署请先跑 Build-Release.ps1：
+    echo     powershell -File scripts\Build-Release.ps1
+    echo  或解压最新的 xiaoxu-music-bridge-windows-x64.zip 到本目录。
+    echo.
     pause
     exit /b 1
 )
@@ -46,8 +51,8 @@ if "%EXT_ID%"=="" (
     exit /b 1
 )
 
-echo  [1/4] Extension ID: %EXT_ID%
-echo  [1/4] Install path: %INSTALL_DIR%
+echo  [1/5] Extension ID: %EXT_ID%
+echo  [1/5] Install path: %INSTALL_DIR%
 echo.
 
 :: Step 1: Kill existing host process
@@ -56,7 +61,9 @@ taskkill /F /IM xiaoxu-music-host.exe >nul 2>&1
 echo  [2/5] OK
 echo.
 
-:: Step 2: Generate host manifest (ConvertTo-Json handles backslash escaping)
+:: Step 2: Generate host manifest (absolute path is REQUIRED by Chrome)
+:: Earlier we shipped the json with a relative path here, and chrome silently
+:: refused to spawn the host. Fixed 2026-09-24.
 echo  [3/5] Generating xiaoxu_music_host.json ...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$j = @{name='xiaoxu_music_host';description='xiaoxu-music-bridge native messaging host';path='%INSTALL_DIR%\xiaoxu-music-host.exe';type='stdio';allowed_origins=@('chrome-extension://%EXT_ID%/')} | ConvertTo-Json -Compress; [System.IO.File]::WriteAllText('%INSTALL_DIR%\xiaoxu_music_host.json', $j)" >nul 2>&1
 if %errorlevel% neq 0 (
@@ -75,11 +82,16 @@ if not exist "%INSTALL_DIR%\xiaoxu_music_host.json" (
 echo  [3/5] OK
 echo.
 
-:: Step 3: Write registry
+:: Step 3: Write registry (Chrome reads the json referenced by these keys)
 echo  [4/5] Writing registry ...
 reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
 reg add "HKLM\Software\Google\Chrome\NativeMessagingHosts\xiaoxu_music_host" /ve /t REG_SZ /d "%INSTALL_DIR%\xiaoxu_music_host.json" /f >nul 2>&1
-echo  [4/5] OK (HKCU + HKLM)
+
+:: Also keep HKCU\...\Run in sync with the actual install path. Previously
+:: the entry pointed to a stale directory (D:\music_bridge\xiaoxu-music-bridge-windows-x64\...)
+:: that no longer existed; the auto-start silently failed.
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "xiaoxu-music-host" /t REG_SZ /d "\"%INSTALL_DIR%\xiaoxu-music-host.exe\" --server" /f >nul 2>&1
+echo  [4/5] OK (HKCU + HKLM + Run)
 echo.
 
 :: Step 4: Create desktop shortcut to host exe
@@ -94,7 +106,7 @@ if %errorlevel% neq 0 (
 echo  [5/5] OK (desktop shortcut created)
 echo.
 
-:: Step 4: Restart Chrome
+:: Step 5: Restart Chrome
 echo  Closing Chrome ...
 taskkill /F /IM chrome.exe >nul 2>&1
 timeout /t 2 /nobreak >nul
