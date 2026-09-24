@@ -12,6 +12,7 @@ public sealed class Fft
     private readonly float[] _cosTable;
     private readonly float[] _sinTable;
     private readonly int[] _bitReverse;
+    private readonly float[] _hannWindow;
 
     public Fft(int size)
     {
@@ -30,8 +31,11 @@ public sealed class Fft
         }
 
         _bitReverse = new int[size];
+        _hannWindow = new float[size];
         for (int i = 0; i < size; i++)
         {
+            _hannWindow[i] = 0.5f * (1f - MathF.Cos(2f * MathF.PI * i / (size - 1)));
+
             int x = i;
             int r = 0;
             for (int j = 0; j < logN; j++)
@@ -101,13 +105,14 @@ public sealed class Fft
     /// <summary>
     /// Apply Hann window in-place.
     /// </summary>
-    public static void ApplyHannWindow(Span<float> buf)
+    public void ApplyHannWindow(Span<float> buf)
     {
-        int n = buf.Length;
-        for (int i = 0; i < n; i++)
+        if (buf.Length < Size)
+            throw new ArgumentException($"buf must be >= {Size} (got {buf.Length}).", nameof(buf));
+
+        for (int i = 0; i < Size; i++)
         {
-            float w = 0.5f * (1f - MathF.Cos(2f * MathF.PI * i / (n - 1)));
-            buf[i] *= w;
+            buf[i] *= _hannWindow[i];
         }
     }
 }

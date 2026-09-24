@@ -206,6 +206,7 @@ public sealed class AudioBeatService : IDisposable
     {
         var frame = new float[FftSize];
         var mag = new float[FftSize / 2];
+        var winFrame = new float[FftSize];
         int frameIdx = 0;
 
         while (_running)
@@ -233,9 +234,8 @@ public sealed class AudioBeatService : IDisposable
             frameIdx = FftSize - HopSize;
 
             // Apply Hann window + FFT
-            var winFrame = new float[FftSize];
             Array.Copy(frame, winFrame, FftSize);
-            Fft.ApplyHannWindow(winFrame);
+            _fft?.ApplyHannWindow(winFrame);
             _fft?.ForwardMagnitude(winFrame, mag);
 
             // Compute features + onsets + beats
